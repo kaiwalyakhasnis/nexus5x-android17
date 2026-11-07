@@ -93,6 +93,10 @@ done
 if [ ! -e /sys/class/drm/renderD128 ] && ! grep -qw android.no_gpu_check /proc/cmdline; then
 	log "no msm GPU after 15 s (RPM did not answer?): not booting Android"
 	touch /run/rpm-failed
+	# booted from the boot partition, with no PC to do it: try again by
+	# itself (a plain restart, so LK boots this image again) unless
+	# scripts/boot.sh has taken over within 30 s
+	( sleep 30; log "RPM failure: restarting to try again"; /sbin/reboot-now normal ) &
 	exec sh </dev/tty1 >/dev/tty1 2>&1
 fi
 

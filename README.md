@@ -40,8 +40,8 @@ smoother. [Gallery as a bubble](media/bubble-gallery.gif).*
 | ✅ | adb (over the USB network), rescue root shell | `adb connect 172.16.42.1:5555`, `telnet 172.16.42.1` |
 | ✅ | KeyMint, Gatekeeper, health, power, thermal, lights (software HALs) | from Google's Android 17 emulator vendor image |
 | ✅ | zram swap | half the RAM, compressed |
-| ⚠️ | system, vendor, data on the phone's own eMMC | flashed (`fastboot flash`); the kernel is still `fastboot boot` only |
-| ⚠️ | Boot reliability | ~1 boot in 6 the RPM doesn't answer (base project's known issue), worse after button resets; the ramdisk detects it and `boot.sh` retries |
+| ✅ | Boots by itself | `boot`, `system`, `vendor`, `userdata` all flashed on the eMMC; no PC needed |
+| ⚠️ | Boot reliability | ~1 boot in 6 the RPM doesn't answer (base project's known issue), worse after button resets; the ramdisk detects it and restarts after 30 s (or `boot.sh` retries from the PC) |
 | ❌ | Suspend | blocked with a wakelock: the phone never wakes from s2idle |
 | ❌ | Wi-Fi, Bluetooth, modem, audio, camera, sensors, GNSS, battery level, RTC | no HAL yet (emulator ones removed) |
 | ❌ | Hardware video codecs | software codecs only |
@@ -158,11 +158,12 @@ scripts/build-bootimg.sh         # out/boot-android-rev-{10,101}.img
 
 # once: flash system, vendor, userdata (back them up first:
 # scripts/backup-partition.sh, from the base project's BusyBox boot)
+fastboot flash boot    out/boot-android-rev-10.img  # or rev-101: fastboot getvar version-hardware
 fastboot flash system  downloads/gsi/extracted/system.img
 fastboot flash vendor  out/vendor.img
 fastboot flash userdata out/userdata.simg   # an empty ext4, 11771295744 bytes
 
-scripts/boot.sh                  # from wherever the phone is: fastboot boot, retries
+scripts/boot.sh                  # or, without flashing boot: fastboot boot, with retries
 adb connect 172.16.42.1:5555     # telnet 172.16.42.1 for a root shell
 ```
 
