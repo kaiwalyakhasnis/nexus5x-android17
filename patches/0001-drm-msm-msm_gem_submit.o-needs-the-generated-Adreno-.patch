@@ -1,0 +1,28 @@
+From d15cdc275b879c7a26a52eeea5953576bd9e720f Mon Sep 17 00:00:00 2001
+From: nexus5x-android17 <nexus5x-android17@localhost>
+Date: Sat, 7 Nov 2026 14:19:30 +0900
+Subject: [PATCH] drm/msm: msm_gem_submit.o needs the generated Adreno headers
+
+msm_gem_submit.c includes adreno/adreno_gpu.h since the
+msm.allow_vram_carveout patch, but it is in msm-y, not adreno-y, so
+nothing orders it after the generated *.xml.h headers: a parallel build
+fails with 'adreno_common.xml.h: No such file or directory'.
+---
+ drivers/gpu/drm/msm/Makefile | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/Makefile b/drivers/gpu/drm/msm/Makefile
+index 13110fcc4..76ce8c139 100644
+--- a/drivers/gpu/drm/msm/Makefile
++++ b/drivers/gpu/drm/msm/Makefile
+@@ -214,5 +214,7 @@ DISPLAY_HEADERS = \
+ 
+ $(addprefix $(obj)/,$(adreno-y)): $(addprefix $(obj)/,$(ADRENO_HEADERS))
+ $(addprefix $(obj)/,$(msm-display-y)): $(addprefix $(obj)/,$(DISPLAY_HEADERS))
++# msm_gem_submit.c includes adreno/adreno_gpu.h (msm.allow_vram_carveout)
++$(obj)/msm_gem_submit.o: $(addprefix $(obj)/,$(ADRENO_HEADERS))
+ 
+ targets += $(ADRENO_HEADERS) $(DISPLAY_HEADERS)
+-- 
+2.43.0
+

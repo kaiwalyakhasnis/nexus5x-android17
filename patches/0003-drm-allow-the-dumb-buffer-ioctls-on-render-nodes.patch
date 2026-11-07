@@ -1,0 +1,36 @@
+From 1103a30610d87767ff546a7e31a0d69982d360ef Mon Sep 17 00:00:00 2001
+From: nexus5x-android17 <nexus5x-android17@localhost>
+Date: Sat, 7 Nov 2026 15:55:20 +0900
+Subject: [PATCH] drm: allow the dumb buffer ioctls on render nodes
+
+Android's gralloc here is the emulator's minigbm, which has no msm
+backend; it runs msm as one of its 'dumb' drivers instead. It opens
+render nodes first, and dumb buffers could only be made on the primary
+node, whose first opener becomes DRM master: the allocator would take
+master away from the hwcomposer. Dumb buffers on the render node avoid
+touching the primary node at all. (On the MSM8992 without an IOMMU they
+come from the same VRAM carveout as everything else.)
+---
+ drivers/gpu/drm/drm_ioctl.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_ioctl.c b/drivers/gpu/drm/drm_ioctl.c
+index 51f399128..e08be1e33 100644
+--- a/drivers/gpu/drm/drm_ioctl.c
++++ b/drivers/gpu/drm/drm_ioctl.c
+@@ -633,9 +633,9 @@ static const struct drm_ioctl_desc drm_ioctls[] = {
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_CLOSEFB, drm_mode_closefb_ioctl, 0),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_PAGE_FLIP, drm_mode_page_flip_ioctl, DRM_MASTER),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_DIRTYFB, drm_mode_dirtyfb_ioctl, DRM_MASTER),
+-	DRM_IOCTL_DEF(DRM_IOCTL_MODE_CREATE_DUMB, drm_mode_create_dumb_ioctl, 0),
+-	DRM_IOCTL_DEF(DRM_IOCTL_MODE_MAP_DUMB, drm_mode_mmap_dumb_ioctl, 0),
+-	DRM_IOCTL_DEF(DRM_IOCTL_MODE_DESTROY_DUMB, drm_mode_destroy_dumb_ioctl, 0),
++	DRM_IOCTL_DEF(DRM_IOCTL_MODE_CREATE_DUMB, drm_mode_create_dumb_ioctl, DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF(DRM_IOCTL_MODE_MAP_DUMB, drm_mode_mmap_dumb_ioctl, DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF(DRM_IOCTL_MODE_DESTROY_DUMB, drm_mode_destroy_dumb_ioctl, DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, drm_mode_obj_get_properties_ioctl, 0),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_OBJ_SETPROPERTY, drm_mode_obj_set_property_ioctl, DRM_MASTER),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_CURSOR2, drm_mode_cursor2_ioctl, DRM_MASTER),
+-- 
+2.43.0
+

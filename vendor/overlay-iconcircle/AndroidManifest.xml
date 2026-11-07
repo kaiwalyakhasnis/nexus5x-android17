@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Circular app icons (the Pixel shape) for the AOSP launcher: a static
+     vendor overlay on the framework's config_icon_mask. Built by
+     scripts/build-overlays.sh into /vendor/overlay. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.bullhead.overlay.iconcircle">
+    <overlay android:targetPackage="android" android:isStatic="true" android:priority="50" />
+    <application android:hasCode="false" />
+</manifest>

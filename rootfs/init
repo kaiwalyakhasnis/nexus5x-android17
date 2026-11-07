@@ -1,0 +1,227 @@
+#!/bin/sh
+# PID 1 from the boot image: stands in for Android's first-stage init.
+#
+# Where system/vendor/data come from (android.disks= on the command line):
+#
+#   emmc (default)  the phone's own partitions, found by name: system (the
+#                   GSI), vendor (out/vendor.img), userdata (Android's /data,
+#                   mounted by Android's init from vendor/fstab.bullhead)
+#   nbd             disk images on the PC over the USB network
+#                   (scripts/serve.sh: qemu-nbd), nothing on the phone written:
+#                   /dev/nbd0 system, /dev/nbd1 vendor, /dev/nbd2 data
+#
+# Then it does what first-stage init does (API filesystems, /dev nodes,
+# switch to the system image as /) and execs Android's init for its second
+# step, "selinux_setup". A telnet shell (172.16.42.1:23, BusyBox, root, in
+# this ramdisk) keeps running next to Android for debugging; Android's files
+# are under /proc/1/root there.
+/bin/busybox mount -t proc proc /proc
+/bin/busybox --install -s
+mount -t sysfs    sysfs    /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /sys/fs/pstore
+mount -t devpts   devpts   /dev/pts
+mount -t tmpfs    tmpfs    /run
+mount -t tmpfs    tmpfs    /tmp
+mount -t pstore   pstore   /sys/fs/pstore 2>/dev/null
+mount -t configfs configfs /sys/kernel/config
+echo 1 > /proc/sys/kernel/printk_devkmsg 2>/dev/null
+log() { echo "pre-init: $*" > /dev/kmsg; echo "pre-init: $*"; }
+
+# a shell on the panel's console if anything below fails (keyboard on OTG)
+rescue() {
+	log "FAILED: $*  (telnet 172.16.42.1 for a shell)"
+	exec sh </dev/tty1 >/dev/tty1 2>&1
+}
+
+# --- USB network + rescue telnet (the same gadget as the Ubuntu boot)
+UDC=
+for i in $(seq 1 10); do
+	UDC=$(ls /sys/class/udc 2>/dev/null | head -n1)
+	[ -n "$UDC" ] && break
+	sleep 1
+done
+[ -n "$UDC" ] || rescue "no USB device controller"
+/usr/share/learn/usb-gadget.sh "$UDC"
+ifconfig lo 127.0.0.1 up
+ifconfig usb0 172.16.42.1 netmask 255.255.255.0 up
+udhcpd /etc/udhcpd.conf
+telnetd -l /bin/sh
+log "USB network up, telnet 172.16.42.1"
+
+# Android's netd flushes every ip rule but priority 0 when it starts (its
+# RouteController puts each network's routes in a table of its own), which
+# drops "lookup main": the only route to the PC, and with it the disks. Keep a
+# rule for the USB subnet in place (it only matches 172.16.42.0/24).
+(
+	while true; do
+		ip rule list 2>/dev/null | grep -q 'to 172.16.42.0/24 lookup main' ||
+			ip rule add to 172.16.42.0/24 table main pref 99 2>/dev/null
+		usleep 200000
+	done
+) &
+
+# Android 17 aborts system_server when the GPU memory BPF map is missing
+# (libmeminfo), and gpuMem.bpf can't load on this kernel (its tracepoint is
+# Android-kernel-only): pin an empty stand-in once Android has mounted
+# /sys/fs/bpf (tools/bpf-map-stub.c). /proc/1/root is Android's view.
+(
+	M=/proc/1/root/sys/fs/bpf/map_gpuMem_gpu_mem_total_map
+	for i in $(seq 1 1200); do
+		# only after Android's BPF loader is done: it creates the real map at
+		# this path if it can, and a map already there makes it fail, which
+		# reboots the phone (bpfloader is reboot_on_failure). netd's maps
+		# exist once it got that far.
+		if ls /proc/1/root/sys/fs/bpf/netd_shared/ 2>/dev/null | grep -q '^map_netd_' &&
+		   ! pidof netbpfload bpfloader >/dev/null 2>&1; then
+			/sbin/bpf-map-stub $M 8 8 1024 && log "pinned a stand-in GPU memory BPF map"
+			break
+		fi
+		usleep 250000
+	done
+) &
+
+# About 1 boot in 6 the RPM (SMD) does not answer (nexus5x-linux-6.12-wip
+# README): no RPM regulators, so no msm display/GPU (the panel keeps LK's
+# Google logo), and Android can't draw. Rebooting from such a boot can hang,
+# so stay up with USB and telnet instead and leave /run/rpm-failed: the PC
+# (scripts/boot.sh) sees it, reads the log and reboots to fastboot itself.
+for i in $(seq 1 15); do
+	[ -e /sys/class/drm/renderD128 ] && break
+	sleep 1
+done
+if [ ! -e /sys/class/drm/renderD128 ] && ! grep -qw android.no_gpu_check /proc/cmdline; then
+	log "no msm GPU after 15 s (RPM did not answer?): not booting Android"
+	touch /run/rpm-failed
+	exec sh </dev/tty1 >/dev/tty1 2>&1
+fi
+
+# The A418 doesn't come back properly from runtime suspend: a4xx_hw_init
+# times out "waiting for GPU to idle" on resume and the next job hangs (it
+# autosuspends after 66 ms idle, i.e. between frames). Keep it powered.
+for g in /sys/bus/platform/devices/*.gpu/power/control; do
+	[ -e "$g" ] && echo on > "$g" && log "GPU runtime suspend off ($g)"
+done
+
+# No working suspend/resume on this port yet: once the screen goes off,
+# Android suspends the system (s2idle) and the phone never wakes up. A kernel
+# wakelock (CONFIG_PM_WAKELOCKS) keeps it from suspending at all.
+echo bullhead-no-suspend > /sys/power/wake_lock && log "suspend blocked (wakelock bullhead-no-suspend)"
+
+DISKS=emmc
+grep -qw android.disks=nbd /proc/cmdline && DISKS=nbd
+
+# an eMMC partition's device by its GPT name (/dev/mmcblk1p41 for "system")
+part() {
+	for u in /sys/class/block/*/uevent; do
+		grep -qx "PARTNAME=$1" "$u" && { echo /dev/$(basename "$(dirname "$u")"); return 0; }
+	done
+	return 1
+}
+
+if [ $DISKS = nbd ]; then
+	# --- the three disks from the PC
+	attach() { # dev export port
+		for i in $(seq 1 90); do
+			[ "$(cat /sys/block/$1/size 2>/dev/null)" -gt 0 ] 2>/dev/null && return 0
+			pgrep -f "nbd-client.*$1\$" >/dev/null || nbd-client -p -N "$2" 172.16.42.2 "$3" /dev/$1
+			sleep 1
+		done
+		return 1
+	}
+	log "waiting for the PC's disks (scripts/serve.sh)"
+	attach nbd0 system 10809 || rescue "no system disk"
+	attach nbd1 vendor 10810 || rescue "no vendor disk"
+	attach nbd2 data   10811 || rescue "no data disk"
+	SYSTEM=/dev/nbd0 VENDOR=/dev/nbd1
+	# Watchdog: Android can't run without the PC (its disks are there). If
+	# the PC stops answering for 30 s (USB network gone, netd broke routing,
+	# cable pulled, serve.sh stopped), go back to fastboot by itself, so the
+	# next image can be booted without buttons. "touch /run/no-watchdog"
+	# (telnet) pauses it.
+	(
+		miss=0
+		while sleep 2; do
+			if [ -e /run/no-watchdog ] || ping -c1 -W2 172.16.42.2 >/dev/null 2>&1; then
+				miss=0
+				continue
+			fi
+			miss=$((miss + 1))
+			[ $miss -eq 5 ] && echo "pre-init watchdog: PC not answering, fastboot in 20 s" > /dev/kmsg
+			if [ $miss -ge 15 ]; then
+				echo "pre-init watchdog: PC gone for 30 s, rebooting to fastboot" > /dev/kmsg
+				/sbin/reboot-now bootloader
+			fi
+		done
+	) &
+else
+	# --- the phone's own partitions (the PC is only needed for adb/telnet)
+	for i in $(seq 1 10); do
+		SYSTEM=$(part system) && VENDOR=$(part vendor) && break
+		sleep 1
+	done
+	[ -n "$SYSTEM" ] && [ -n "$VENDOR" ] || rescue "no system/vendor partition on the eMMC"
+fi
+log "disks ($DISKS): system $SYSTEM, vendor $VENDOR"
+
+# no RTC driver yet: take the PC's clock if it serves it (scripts/serve.sh)
+T=$(wget -q -T 3 -O- http://172.16.42.2:10880/time 2>/dev/null) && date -u -s "@$T" >/dev/null && log "clock set from the PC: $(date -u)"
+
+# --- system as /, vendor on /vendor (both read-only)
+R=/newroot
+mkdir -p $R
+mount -t ext4 -o ro $SYSTEM $R || rescue "mount system ($SYSTEM)"
+mount -t ext4 -o ro $VENDOR $R/vendor || rescue "mount vendor ($VENDOR)"
+
+# --- kernel modules from /vendor/lib/modules (networking for netd, dm-verity
+# for apexd): they did not fit in LK's kernel window. modules.load lists them.
+K=$(uname -r)
+if [ -d $R/vendor/lib/modules/$K ]; then
+	mkdir -p /lib/modules
+	mount --bind $R/vendor/lib/modules /lib/modules
+	n=0
+	for m in $(cat /lib/modules/$K/modules.load 2>/dev/null); do
+		modprobe "$m" 2>/dev/null && n=$((n + 1)) || log "modprobe $m failed"
+	done
+	umount /lib/modules
+	log "loaded $n modules"
+fi
+
+# --- what first-stage init leaves for the second stage
+# (system/core/init/first_stage_init.cpp)
+mount -t tmpfs -o mode=0755,nosuid tmpfs $R/dev
+mkdir -p $R/dev/pts $R/dev/socket $R/dev/dm-user
+mount -t devpts -o gid=5,mode=620 devpts $R/dev/pts
+mknod -m 600 $R/dev/kmsg c 1 11
+mknod -m 666 $R/dev/null c 1 3
+mknod -m 666 $R/dev/random c 1 8
+mknod -m 666 $R/dev/urandom c 1 9
+mknod -m 666 $R/dev/ptmx c 5 2
+mknod -m 600 $R/dev/console c 5 1
+# /data's device for vendor/fstab.bullhead, the same name in both modes
+# (ueventd creates the node itself later; fs_mgr waits for it)
+mkdir -p $R/dev/block
+if [ $DISKS = nbd ]; then
+	ln -s /dev/block/nbd2 $R/dev/block/data
+else
+	D=$(part userdata) || rescue "no userdata partition on the eMMC"
+	ln -s /dev/block/${D#/dev/} $R/dev/block/data
+fi
+mount -t proc -o hidepid=2,gid=3009 proc $R/proc
+mount -t sysfs sysfs $R/sys
+mount -t selinuxfs selinuxfs $R/sys/fs/selinux
+mount -t tmpfs -o mode=0755,uid=0,gid=1000 tmpfs $R/mnt
+mkdir -p $R/mnt/vendor $R/mnt/product
+mount -t tmpfs -o mode=0755,uid=0,gid=0 tmpfs $R/debug_ramdisk
+mount -t tmpfs -o mode=0755,uid=0,gid=0 tmpfs $R/second_stage_resources
+# /metadata would be a small partition (aconfig flag storage, vold
+# checkpoints, bootstat). A tmpfs for now: it starts empty on every boot.
+mount -t tmpfs -o mode=0755,uid=0,gid=0,size=16m tmpfs $R/metadata
+log "handing over to Android's init (selinux_setup)"
+
+# Not switch_root: that empties this ramdisk, and the telnet shell and the
+# nbd-clients started from it still need it. Moving the new root over / and
+# chrooting into it leaves them in the old root.
+cd $R
+mount --move . /
+exec chroot . /system/bin/init selinux_setup

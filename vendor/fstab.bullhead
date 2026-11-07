@@ -1,0 +1,9 @@
+# Android fstab for bullhead on mainline 6.12. system and vendor are mounted
+# by the ramdisk's /init before Android's init runs, so only /data is here:
+# /dev/block/data, a link the ramdisk's /init makes to the userdata partition
+# (or to /dev/nbd2, the PC's out/data.img, with android.disks=nbd).
+# Not encrypted yet (no metadata partition, no fileencryption=).
+#<src>              <mnt_point>  <type>  <mnt_flags and options>          <fs_mgr_flags>
+/dev/block/data     /data        ext4    noatime,nosuid,nodev  wait,check,formattable,latemount
+# compressed swap in RAM (2 GB phone): init's swapon_all sets it up
+/dev/block/zram0    none         swap    defaults              zramsize=50%,max_comp_streams=4

@@ -1,0 +1,9 @@
+# big, downloaded or generated: see README "Build and boot"
+/downloads/
+/src/
+/out/
+/tools/android-ndk-*/
+/tools/venv/
+# raw partition backups of the phone (stock system/vendor): never commit
+/backup/
+/out-build-kernel.log

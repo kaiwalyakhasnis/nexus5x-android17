@@ -1,0 +1,76 @@
+From 3dad1db03f61f831bbd7051746b323b40398ddb3 Mon Sep 17 00:00:00 2001
+From: nexus5x-android17 <nexus5x-android17@localhost>
+Date: Sat, 7 Nov 2026 15:19:59 +0900
+Subject: [PATCH] bpf: allow bpf_get_netns_cookie() in cgroup_skb and tc
+ programs
+
+Android 17's netd BPF program ingress_stats_6_12_75 (picked for kernels
+>= 6.12.75) calls bpf_get_netns_cookie() with an __sk_buff context. The
+Android common kernel allows it; kernel.org 6.12 rejects the program
+('program of this type cannot use helper bpf_get_netns_cookie#122'),
+netbpfload treats that as critical and init reboots the phone
+(reboot,bpfloader-failed).
+
+The cookie is that of the skb's socket's netns (always set for
+cgroup_skb), else the device's; a NULL ctx gives init_net's, as for the
+other program types.
+---
+ net/core/filter.c | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/net/core/filter.c b/net/core/filter.c
+index a680cf27a..9acfdc380 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -5287,6 +5287,30 @@ static const struct bpf_func_proto bpf_get_netns_cookie_sk_msg_proto = {
+ 	.arg1_type	= ARG_PTR_TO_CTX_OR_NULL,
+ };
+ 
++/* Android 17's netd (ingress_stats for kernels >= 6.12.75) calls
++ * bpf_get_netns_cookie() from cgroup_skb programs, which Android's common
++ * kernel allows and kernel.org 6.12 does not. The netns is the socket's
++ * (always set for cgroup_skb), else the device's; NULL ctx means init_net,
++ * as for the other program types.
++ */
++BPF_CALL_1(bpf_get_netns_cookie_skb, struct sk_buff *, skb)
++{
++	const struct net *net = &init_net;
++
++	if (skb && skb->sk)
++		net = sock_net(skb->sk);
++	else if (skb && skb->dev)
++		net = dev_net(skb->dev);
++	return net->net_cookie;
++}
++
++static const struct bpf_func_proto bpf_get_netns_cookie_skb_proto = {
++	.func		= bpf_get_netns_cookie_skb,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_PTR_TO_CTX_OR_NULL,
++};
++
+ BPF_CALL_1(bpf_get_socket_uid, struct sk_buff *, skb)
+ {
+ 	struct sock *sk = sk_to_full_sk(skb->sk);
+@@ -8204,6 +8228,8 @@ cg_skb_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ 		return &bpf_sk_storage_delete_proto;
+ 	case BPF_FUNC_perf_event_output:
+ 		return &bpf_skb_event_output_proto;
++	case BPF_FUNC_get_netns_cookie:
++		return &bpf_get_netns_cookie_skb_proto;
+ #ifdef CONFIG_SOCK_CGROUP_DATA
+ 	case BPF_FUNC_skb_cgroup_id:
+ 		return &bpf_skb_cgroup_id_proto;
+@@ -8239,6 +8265,8 @@ static const struct bpf_func_proto *
+ tc_cls_act_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ {
+ 	switch (func_id) {
++	case BPF_FUNC_get_netns_cookie:
++		return &bpf_get_netns_cookie_skb_proto;
+ 	case BPF_FUNC_skb_store_bytes:
+ 		return &bpf_skb_store_bytes_proto;
+ 	case BPF_FUNC_skb_load_bytes:
+-- 
+2.43.0
+

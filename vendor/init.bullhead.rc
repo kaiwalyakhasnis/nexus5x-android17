@@ -1,0 +1,89 @@
+# Nexus 5X (bullhead) on mainline Linux 6.12, Android 17 GSI.
+# Imported by the GSI's init.rc as /vendor/etc/init/hw/init.${ro.hardware}.rc
+# (androidboot.hardware=bullhead). Replaces the emulator's init.ranchu.rc,
+# whose services (qemu-props, goldfish logcat, virtio Bluetooth, ...) only
+# make sense under QEMU.
+#
+# system and vendor are already mounted by the ramdisk's /init (from the PC,
+# over NBD); /data is /dev/block/nbd2, also from the PC.
+
+on early-init
+    # shared memory from memfd: Android 17 only picks memfd by itself when the
+    # kernel's SELinux has the memfd_class policy capability (6.12 doesn't),
+    # and otherwise wants /dev/ashmem, which kernel.org Linux dropped in 5.18
+    setprop sys.use_memfd true
+
+    # 2 GB of RAM
+    setprop dalvik.vm.heapsize 256m
+    setprop dalvik.vm.heapgrowthlimit 128m
+
+    # --- graphics: Adreno 418 + MDP5 through the msm DRM driver
+    # EGL/GLES: Mesa freedreno (/vendor/lib64/egl/lib*_mesa.so)
+    setprop ro.hardware.egl mesa
+    setprop ro.opengles.version 196609
+    # tiled (GMEM) rendering draws garbage on the A418 so far: render
+    # straight to memory (FD_MESA_DEBUG=sysmem, read by Mesa as a property)
+    setprop vendor.mesa.fd.mesa.debug sysmem
+    # no Vulkan driver: GL everywhere
+    setprop debug.hwui.renderer skiagl
+    setprop debug.renderengine.backend skiaglthreaded
+    # gralloc: the emulator's minigbm, with msm as a dumb-buffer driver
+    setprop ro.hardware.gralloc minigbm
+    # composer: the emulator's HWC3 in "client" mode, which shows
+    # SurfaceFlinger's GPU-composed frame on the msm KMS plane
+    setprop ro.vendor.hwcomposer.mode client
+    # displays from the DRM connectors (DSI-1), not from the emulator host
+    setprop ro.vendor.hwcomposer.display_finder_mode drm
+    # 1080x1920 on 5.2"
+    setprop ro.sf.lcd_density 420
+    # no hardware navigation keys: show the on-screen navigation bar
+    setprop qemu.hw.mainkeys 0
+
+on init
+    # adb over the USB network (the ramdisk's NCM gadget, 172.16.42.1):
+    # Android must not take the USB gadget over, or the NBD disks go with it
+    setprop sys.usb.configfs 0
+    setprop service.adb.tcp.port 5555
+
+on fs
+    mount_all /vendor/etc/fstab.bullhead --early
+
+on late-fs
+    mount_all /vendor/etc/fstab.bullhead --late
+
+on post-fs-data
+    mkdir /data/vendor/var 0755 root root
+    mkdir /data/vendor/var/run 0755 root root
+    # this is a user build (ro.adb.secure=1) with no screen to accept a key
+    # on yet: trust the PC's key (make-vendor.py copies ~/.android/adbkey.pub)
+    copy /vendor/etc/adb_keys /data/misc/adb/adb_keys
+    chown system shell /data/misc/adb/adb_keys
+    chmod 0640 /data/misc/adb/adb_keys
+
+on boot
+    # zram swap from fstab.bullhead (half the RAM, compressed)
+    write /proc/sys/vm/page-cluster 0
+    swapon_all /vendor/etc/fstab.bullhead
+    chown root system /sys/power/wake_lock
+    chown root system /sys/power/wake_unlock
+    setprop persist.sys.usb.config adb
+    setprop sys.usb.config adb
+
+# the goldfish allocator would race minigbm for IAllocator/default
+service vendor.graphics.allocator.ranchu /vendor/bin/hw/android.hardware.graphics.allocator-service.ranchu
+    override
+    class hal
+    user system
+    disabled
+
+# the emulator's composer, told the msm device is the virtio-gpu it looks for
+# (tools/hwc-msm-shim.c); otherwise as in its own hwc3.rc
+service vendor.hwcomposer-3 /vendor/bin/hw/android.hardware.graphics.composer3-service.ranchu
+    override
+    class hal animation
+    user system
+    group graphics drmrpc
+    capabilities SYS_NICE
+    onrestart restart surfaceflinger
+    task_profiles ServiceCapacityLow
+    setenv LD_PRELOAD /vendor/lib64/libhwc_msm_shim.so
