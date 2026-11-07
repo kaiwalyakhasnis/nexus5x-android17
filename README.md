@@ -9,7 +9,7 @@
 
 Google's official **Android 17 GSI** (`aosp_arm64-exp`, build
 `CP3A.260905.010`, a *user* build) running on the LG Nexus 5X (bullhead,
-Snapdragon 808 / MSM8992), which shipped with Android 6 and Linux 3.10. It
+Snapdragon 808 / MSM8992). It
 boots on the kernel.org **Linux 6.12** port from
 [nexus5x-linux-6.12-ubuntu-26.04LTS](https://github.com/kaiwalyakhasnis/nexus5x-linux-6.12-ubuntu-26.04LTS),
 and the **Adreno 418 GPU** draws it with **Mesa freedreno**, built here with
