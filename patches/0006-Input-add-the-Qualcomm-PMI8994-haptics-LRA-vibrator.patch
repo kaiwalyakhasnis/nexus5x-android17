@@ -1,0 +1,367 @@
+From c480983a7facd7c508505e6f8830956622b58767 Mon Sep 17 00:00:00 2001
+From: kk <kaiwalyakhasnis57@gmail.com>
+Date: Sun, 8 Nov 2026 20:38:54 +0900
+Subject: [PATCH] Input: add the Qualcomm PMI8994 haptics (LRA vibrator)
+
+The Nexus 5X's vibrator is an LRA motor on the PMI8994's haptics block,
+driven in 3.10 by qpnp-haptic. Mainline has no driver for it. This is a
+force-feedback (FF_RUMBLE, ff-memless) input device like
+pm8xxx-vibrator, using the block's direct play mode only: it configures
+the block as qpnp-haptic did (LRA, QWD auto-resonance, current limit,
+short-circuit debounce, 505 kHz PWM, sine wave, resonance period,
+brake), and a rumble's strength sets the drive voltage up to the DT's
+vmax. Not ported: buffer/PWM/audio play, driver-side LRA frequency
+correction.
+---
+ drivers/input/misc/Kconfig           |   9 +
+ drivers/input/misc/Makefile          |   1 +
+ drivers/input/misc/pmi8994-haptics.c | 308 +++++++++++++++++++++++++++
+ 3 files changed, 318 insertions(+)
+ create mode 100644 drivers/input/misc/pmi8994-haptics.c
+
+diff --git a/drivers/input/misc/Kconfig b/drivers/input/misc/Kconfig
+index 6a852c763..1320ba06b 100644
+--- a/drivers/input/misc/Kconfig
++++ b/drivers/input/misc/Kconfig
+@@ -191,6 +191,15 @@ config INPUT_PM8941_PWRKEY
+ 	  To compile this driver as a module, choose M here: the module
+ 	  will be called pm8941-pwrkey.
+ 
++config INPUT_PMI8994_HAPTICS
++	tristate "Qualcomm PMI8994 haptics (LRA vibrator)"
++	depends on MFD_SPMI_PMIC || COMPILE_TEST
++	depends on OF
++	select INPUT_FF_MEMLESS
++	help
++	  The vibrator of phones with a Qualcomm PMI8994 PMIC driving an LRA
++	  motor (the Nexus 5X), as a force-feedback input device.
++
+ config INPUT_PM8XXX_VIBRATOR
+ 	tristate "Qualcomm PM8XXX vibrator support"
+ 	depends on MFD_PM8XXX || MFD_SPMI_PMIC
+diff --git a/drivers/input/misc/Makefile b/drivers/input/misc/Makefile
+index 4f7f73683..3cb45b50a 100644
+--- a/drivers/input/misc/Makefile
++++ b/drivers/input/misc/Makefile
+@@ -92,3 +92,4 @@ obj-$(CONFIG_INPUT_WM831X_ON)		+= wm831x-on.o
+ obj-$(CONFIG_INPUT_XEN_KBDDEV_FRONTEND)	+= xen-kbdfront.o
+ obj-$(CONFIG_INPUT_YEALINK)		+= yealink.o
+ obj-$(CONFIG_INPUT_IDEAPAD_SLIDEBAR)	+= ideapad_slidebar.o
++obj-$(CONFIG_INPUT_PMI8994_HAPTICS)	+= pmi8994-haptics.o
+diff --git a/drivers/input/misc/pmi8994-haptics.c b/drivers/input/misc/pmi8994-haptics.c
+new file mode 100644
+index 000000000..f1c0101cd
+--- /dev/null
++++ b/drivers/input/misc/pmi8994-haptics.c
+@@ -0,0 +1,308 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * PMI8994 haptics (the Nexus 5X's vibrator: an LRA motor on the PMIC's
++ * haptics block), as a force-feedback (FF_RUMBLE) input device, like
++ * pm8xxx-vibrator for the older PMICs.
++ *
++ * Only "direct" play is used: the block drives the motor at the LRA's
++ * resonance while PLAY is set. The configuration is the bullhead 3.10
++ * qpnp-haptic driver's (actuator type, auto-resonance, current limit,
++ * short-circuit debounce, PWM, wave shape, resonance period, brake), from
++ * its DT values; the strength sets the drive voltage, up to vmax-mv.
++ * Not ported: buffer/PWM/audio play and the driver-side LRA frequency
++ * correction (the PMIC's own auto-resonance stays on).
++ */
++
++#include <linux/bitfield.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/input.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/slab.h>
++
++/* registers, from the block's base (qpnp-haptic.c) */
++#define HAP_STATUS		0x0a
++#define  HAP_STATUS_BUSY	BIT(1)
++#define  HAP_SC_FOUND		BIT(3)
++#define HAP_EN_CTL		0x46
++#define  HAP_EN			BIT(7)
++#define HAP_EN_CTL2		0x48
++#define  HAP_BRAKE_EN		BIT(0)
++#define HAP_ACT_TYPE		0x4c
++#define  HAP_ACT_LRA		0
++#define HAP_WAV_SHAPE		0x4d
++#define  HAP_WAV_SINE		0
++#define HAP_PLAY_MODE		0x4e
++#define  HAP_PLAY_MODE_MASK	GENMASK(5, 4)
++#define  HAP_PLAY_DIRECT	0
++#define HAP_LRA_AUTO_RES	0x4f
++#define  HAP_AUTO_RES_MODE	GENMASK(6, 4)
++#define   HAP_AUTO_RES_QWD	2
++#define  HAP_LRA_HIGH_Z		GENMASK(3, 2)
++#define   HAP_HIGH_Z_OPT1	1
++#define  HAP_RES_CAL_PERIOD	GENMASK(1, 0)
++#define HAP_VMAX		0x51
++#define  HAP_VMAX_MASK		GENMASK(5, 1)
++#define  HAP_VMAX_STEP_MV	116
++#define  HAP_VMAX_MAX_MV	3596
++#define HAP_ILIM		0x52
++#define  HAP_ILIM_800MA		BIT(0)
++#define HAP_SC_DEB		0x53
++#define  HAP_SC_DEB_MASK	GENMASK(2, 0)
++#define HAP_RATE_CFG1		0x54
++#define HAP_RATE_CFG2		0x55
++#define  HAP_RATE_CFG2_MASK	GENMASK(3, 0)
++#define  HAP_RATE_STEP_US	5
++#define HAP_INT_PWM		0x56
++#define HAP_PWM_CAP		0x58
++#define  HAP_PWM_FREQ_MASK	GENMASK(1, 0)
++#define HAP_SC_CLR		0x59
++#define HAP_BRAKE		0x5c
++#define HAP_PLAY		0x70
++#define  HAP_PLAY_EN		BIT(7)
++#define HAP_SEC_ACCESS		0xd0
++#define  HAP_SEC_UNLOCK		0xa5
++#define HAP_TEST2		0xe3
++#define  HAP_AUTO_RES_EN	BIT(7)
++
++#define AUTO_RES_SETTLE_US	20000	/* before auto-resonance is enabled */
++#define STOP_CYCLES		5	/* resonance periods to wait for idle */
++
++struct pmi8994_haptics {
++	struct device *dev;
++	struct regmap *regmap;
++	struct input_dev *input;
++	struct work_struct work;
++	struct mutex lock;
++	u32 base;
++	u32 vmax_mv;		/* the drive voltage at full strength */
++	u32 play_rate_us;	/* the LRA's resonance period */
++	unsigned int magnitude;	/* requested: 0 (off) .. 0xffff */
++	bool playing;
++};
++
++static int hap_write(struct pmi8994_haptics *h, u32 reg, u32 val)
++{
++	return regmap_write(h->regmap, h->base + reg, val);
++}
++
++static int hap_update(struct pmi8994_haptics *h, u32 reg, u32 mask, u32 val)
++{
++	return regmap_update_bits(h->regmap, h->base + reg, mask, val);
++}
++
++/* TEST2 is behind the peripheral's secure access unlock */
++static int hap_auto_res(struct pmi8994_haptics *h, bool on)
++{
++	unsigned int val;
++	int ret;
++
++	ret = regmap_read(h->regmap, h->base + HAP_TEST2, &val);
++	if (ret)
++		return ret;
++	val = (val & ~HAP_AUTO_RES_EN) | (on ? HAP_AUTO_RES_EN : 0);
++	ret = hap_write(h, HAP_SEC_ACCESS, HAP_SEC_UNLOCK);
++	if (ret)
++		return ret;
++	return hap_write(h, HAP_TEST2, val);
++}
++
++/* qpnp-haptic's qpnp_hap_config(), LRA in direct play mode */
++static int hap_config(struct pmi8994_haptics *h)
++{
++	/* bullhead's brake pattern (qcom,brake-pattern = [03 03 03 03]) */
++	u32 ilim_ma = 400, sc_deb = 8, rate, brake[4] = { 3, 3, 3, 3 };
++	int ret, i;
++	u32 val;
++
++	of_property_read_u32(h->dev->of_node, "qcom,ilim-ma", &ilim_ma);
++
++	ret = hap_update(h, HAP_ACT_TYPE, BIT(0), HAP_ACT_LRA);
++	/* auto-resonance: QWD, high-Z option 1, calibrated every 4 periods */
++	ret = ret ?: hap_update(h, HAP_LRA_AUTO_RES,
++				HAP_AUTO_RES_MODE | HAP_LRA_HIGH_Z | HAP_RES_CAL_PERIOD,
++				FIELD_PREP(HAP_AUTO_RES_MODE, HAP_AUTO_RES_QWD) |
++				FIELD_PREP(HAP_LRA_HIGH_Z, HAP_HIGH_Z_OPT1) |
++				FIELD_PREP(HAP_RES_CAL_PERIOD, (fls(4) - 1) - 2));
++	ret = ret ?: hap_update(h, HAP_PLAY_MODE, HAP_PLAY_MODE_MASK,
++				FIELD_PREP(HAP_PLAY_MODE_MASK, HAP_PLAY_DIRECT));
++	ret = ret ?: hap_update(h, HAP_ILIM, HAP_ILIM_800MA,
++				ilim_ma >= 800 ? HAP_ILIM_800MA : 0);
++	/* short-circuit debounce: 8 cycles */
++	ret = ret ?: hap_update(h, HAP_SC_DEB, HAP_SC_DEB_MASK, (fls(sc_deb) - 1) - 2);
++	/* internal PWM: 505 kHz */
++	ret = ret ?: hap_update(h, HAP_INT_PWM, HAP_PWM_FREQ_MASK, 1);
++	ret = ret ?: hap_update(h, HAP_PWM_CAP, HAP_PWM_FREQ_MASK, 1);
++	ret = ret ?: hap_update(h, HAP_WAV_SHAPE, BIT(0), HAP_WAV_SINE);
++	/* the LRA's resonance period, in 5 us steps */
++	rate = h->play_rate_us / HAP_RATE_STEP_US;
++	ret = ret ?: hap_write(h, HAP_RATE_CFG1, rate & 0xff);
++	ret = ret ?: hap_update(h, HAP_RATE_CFG2, HAP_RATE_CFG2_MASK, rate >> 8);
++	/* active braking when it stops */
++	ret = ret ?: hap_update(h, HAP_EN_CTL2, HAP_BRAKE_EN, HAP_BRAKE_EN);
++	for (i = 3, val = 0; i >= 0; i--)
++		val |= (brake[i] & 3) << (i * 2);
++	ret = ret ?: hap_write(h, HAP_BRAKE, val);
++	/* off */
++	ret = ret ?: hap_update(h, HAP_PLAY, HAP_PLAY_EN, 0);
++	ret = ret ?: hap_update(h, HAP_EN_CTL, HAP_EN, 0);
++	return ret;
++}
++
++/* qpnp-haptic's qpnp_hap_set() for direct play, mutex held */
++static void hap_set(struct pmi8994_haptics *h, unsigned int magnitude)
++{
++	unsigned int status;
++	u32 mv;
++	int i;
++
++	if (magnitude) {
++		/* the strength sets the drive voltage, at least one step */
++		mv = max_t(u32, HAP_VMAX_STEP_MV, mult_frac(h->vmax_mv, magnitude, 0xffff));
++		hap_update(h, HAP_VMAX, HAP_VMAX_MASK,
++			   FIELD_PREP(HAP_VMAX_MASK, mv / HAP_VMAX_STEP_MV));
++		if (h->playing)
++			return;		/* only the strength changed */
++
++		/* a short circuit (SC_FOUND) latches it off until cleared */
++		if (!regmap_read(h->regmap, h->base + HAP_STATUS, &status) &&
++		    (status & HAP_SC_FOUND)) {
++			dev_warn_ratelimited(h->dev, "short circuit cleared\n");
++			hap_write(h, HAP_SC_CLR, 1);
++		}
++		hap_auto_res(h, false);
++		hap_update(h, HAP_EN_CTL, HAP_EN, HAP_EN);
++		hap_update(h, HAP_PLAY, HAP_PLAY_EN, HAP_PLAY_EN);
++		usleep_range(AUTO_RES_SETTLE_US, AUTO_RES_SETTLE_US + 1000);
++		hap_auto_res(h, true);
++		h->playing = true;
++	} else {
++		if (!h->playing)
++			return;
++		hap_update(h, HAP_PLAY, HAP_PLAY_EN, 0);
++		/* let the brake finish before the module goes off */
++		for (i = 0; i < STOP_CYCLES; i++) {
++			if (regmap_read(h->regmap, h->base + HAP_STATUS, &status) ||
++			    !(status & HAP_STATUS_BUSY))
++				break;
++			usleep_range(h->play_rate_us, h->play_rate_us + 100);
++		}
++		hap_update(h, HAP_EN_CTL, HAP_EN, 0);
++		h->playing = false;
++	}
++}
++
++static void hap_work(struct work_struct *work)
++{
++	struct pmi8994_haptics *h = container_of(work, struct pmi8994_haptics, work);
++
++	mutex_lock(&h->lock);
++	hap_set(h, READ_ONCE(h->magnitude));
++	mutex_unlock(&h->lock);
++}
++
++/* ff-memless: timing is done for us; this may run in atomic context */
++static int hap_play_effect(struct input_dev *dev, void *data, struct ff_effect *effect)
++{
++	struct pmi8994_haptics *h = input_get_drvdata(dev);
++
++	WRITE_ONCE(h->magnitude, max(effect->u.rumble.strong_magnitude,
++				     effect->u.rumble.weak_magnitude));
++	schedule_work(&h->work);
++	return 0;
++}
++
++static void hap_close(struct input_dev *dev)
++{
++	struct pmi8994_haptics *h = input_get_drvdata(dev);
++
++	cancel_work_sync(&h->work);
++	mutex_lock(&h->lock);
++	hap_set(h, 0);
++	mutex_unlock(&h->lock);
++}
++
++static int pmi8994_haptics_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct pmi8994_haptics *h;
++	struct input_dev *input;
++	int ret;
++
++	h = devm_kzalloc(dev, sizeof(*h), GFP_KERNEL);
++	if (!h)
++		return -ENOMEM;
++	h->dev = dev;
++	platform_set_drvdata(pdev, h);
++	mutex_init(&h->lock);
++	INIT_WORK(&h->work, hap_work);
++
++	h->regmap = dev_get_regmap(dev->parent, NULL);
++	if (!h->regmap)
++		return dev_err_probe(dev, -ENODEV, "no PMIC regmap\n");
++	ret = of_property_read_u32(dev->of_node, "reg", &h->base);
++	if (ret)
++		return dev_err_probe(dev, ret, "reg\n");
++	h->vmax_mv = 1800;
++	of_property_read_u32(dev->of_node, "qcom,vmax-mv", &h->vmax_mv);
++	h->vmax_mv = clamp_t(u32, h->vmax_mv, HAP_VMAX_STEP_MV, HAP_VMAX_MAX_MV);
++	h->play_rate_us = 5715;
++	of_property_read_u32(dev->of_node, "qcom,wave-play-rate-us", &h->play_rate_us);
++
++	ret = hap_config(h);
++	if (ret)
++		return dev_err_probe(dev, ret, "configuring the haptics block\n");
++
++	input = devm_input_allocate_device(dev);
++	if (!input)
++		return -ENOMEM;
++	h->input = input;
++	input->name = "pmi8994-haptics";
++	input->id.bustype = BUS_HOST;
++	input->close = hap_close;
++	input_set_drvdata(input, h);
++	input_set_capability(input, EV_FF, FF_RUMBLE);
++
++	ret = input_ff_create_memless(input, NULL, hap_play_effect);
++	if (ret)
++		return dev_err_probe(dev, ret, "ff-memless\n");
++	ret = input_register_device(input);
++	if (ret)
++		return dev_err_probe(dev, ret, "input\n");
++
++	dev_info(dev, "LRA, %u mV max, resonance period %u us\n",
++		 h->vmax_mv, h->play_rate_us);
++	return 0;
++}
++
++static void pmi8994_haptics_remove(struct platform_device *pdev)
++{
++	struct pmi8994_haptics *h = platform_get_drvdata(pdev);
++
++	if (h)
++		cancel_work_sync(&h->work);
++}
++
++static const struct of_device_id pmi8994_haptics_of_match[] = {
++	{ .compatible = "qcom,pmi8994-haptics" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, pmi8994_haptics_of_match);
++
++static struct platform_driver pmi8994_haptics_driver = {
++	.probe = pmi8994_haptics_probe,
++	.remove = pmi8994_haptics_remove,
++	.driver = {
++		.name = "pmi8994-haptics",
++		.of_match_table = pmi8994_haptics_of_match,
++	},
++};
++module_platform_driver(pmi8994_haptics_driver);
++
++MODULE_DESCRIPTION("PMI8994 haptics (LRA vibrator), direct play");
++MODULE_LICENSE("GPL");
+-- 
+2.43.0
+

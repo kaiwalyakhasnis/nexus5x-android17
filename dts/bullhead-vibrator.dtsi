@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * The Nexus 5X's vibrator: an LRA motor on the PMI8994's haptics block
+ * (stock: pmi8994_haptics, qcom,haptic@c000, enabled and tuned in
+ * msm8992-bullhead.dtsi), driven by drivers/input/misc/pmi8994-haptics.c
+ * (patches/0006) as a force-feedback input device.
+ *
+ * Stock values: LRA resonance period 4347 us (~230 Hz), 400 mA current
+ * limit, 1800 mV for haptic feedback and 2500 mV ("vmax-mv-ind") for
+ * vibrations of 800 ms and longer. Full strength here is the 2500 mV; the
+ * vibrator HAL (hal/vibrator) asks for 1800 mV for short ones.
+ */
+
+&spmi_bus {
+	pmic@3 {
+		haptics@c000 {
+			compatible = "qcom,pmi8994-haptics";
+			reg = <0xc000>;
+			qcom,vmax-mv = <2500>;
+			qcom,ilim-ma = <400>;
+			qcom,wave-play-rate-us = <4347>;
+		};
+	};
+};

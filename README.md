@@ -17,7 +17,8 @@ the Android NDK. No AOSP tree and no framework build: the PC this was made on
 is far too slow for that.
 
 Beyond display and touch, **Wi-Fi**, **all 16 sensors**, **brightness and
-auto-brightness**, the **notification LED** and the **battery level** work
+auto-brightness**, the **notification LED**, the **vibrator** and the
+**battery level** work
 through Android's normal APIs, with HALs built from the SDK and NDK alone.
 [docs/](docs/) has one page per service: how it was brought up and tested.
 
@@ -47,13 +48,14 @@ smoother. [Gallery as a bubble](media/bubble-gallery.gif).*
 | ✅ | Brightness slider, auto-brightness, notification LED | PMI8994 WLED + LPG (mainline drivers) and our NDK-built lights HAL; see [docs/lights.md](docs/lights.md) |
 | ✅ | Wi-Fi: scan, connect, internet (2.4 and 5 GHz) | mainline `ath10k` (the base project's PCIe), the emulator's generic Wi-Fi HAL and `wpa_supplicant`; see [docs/wifi.md](docs/wifi.md) |
 | ✅ | Battery level and charging state in the status bar | a read-only PMI8994 charger/fuel-gauge status driver; see [docs/battery.md](docs/battery.md) |
+| ✅ | Vibrator: notifications, calls, touch feedback, apps | a new PMI8994 haptics driver (LRA motor) and our NDK-built vibrator HAL; see [docs/vibrator.md](docs/vibrator.md) |
 | ⚠️ | Charging speed | the PMIC charges on its own defaults: USB 500 mA mode, so slowly, and it pauses when the battery gets hot. No battery voltage or temperature in Android yet |
 | ✅ | KeyMint, Gatekeeper, health, power, thermal (software HALs) | from Google's Android 17 emulator vendor image |
 | ✅ | zram swap | half the RAM, compressed |
 | ✅ | Boots by itself | `boot`, `system`, `vendor`, `userdata` all flashed on the eMMC; no PC needed |
 | ⚠️ | Boot reliability | ~1 boot in 6 the RPM doesn't answer (base project's known issue), worse after button resets; the ramdisk detects it and restarts after 30 s (or `boot.main.kts` retries from the PC) |
 | ❌ | Suspend | blocked with a wakelock: the phone never wakes from s2idle |
-| ❌ | Bluetooth, modem, audio, camera, GNSS, RTC, vibrator | no driver or HAL yet (emulator ones removed) |
+| ❌ | Bluetooth, modem, audio, camera, GNSS, RTC | no driver or HAL yet (emulator ones removed) |
 | ❌ | Hardware video codecs | software codecs only |
 
 ## How it fits together
@@ -179,7 +181,7 @@ export PATH=$PWD/tools/kotlinc/bin:$PATH JAVA_HOME=/usr/lib/jvm/java-21-openjdk-
 scripts/build-kernel.main.kts    # kernel + modules (out/kernel, out/modules)
 scripts/build-mesa.main.kts      # out/mesa/lib64/egl/*_mesa.so
 scripts/build-overlays.main.kts  # out/overlay/*.apk
-scripts/build-hal.main.kts       # out/hal/: sensors + lights HALs (SDK aidl + NDK; fetches ~7 MB of AOSP)
+scripts/build-hal.main.kts       # out/hal/: sensors, lights, vibrator HALs (SDK aidl + NDK; fetches ~7 MB of AOSP)
 VENDOR_SIZE=248M scripts/make-vendor.main.kts   # out/vendor.img, the partition's size
 scripts/build-bootimg.main.kts   # out/boot-android-rev-{10,101}.img (+ tools/phone)
 
@@ -210,12 +212,12 @@ phone written; that's how the first boots were done.
 | Path | What it is |
 |---|---|
 | [config/android.config](config/android.config) | Android's kernel options, on top of the base project's `kernel.config` |
-| [docs/](docs/) | one page per hardware service brought up: hardware, kernel, HAL, testing, what it took ([sensors](docs/sensors.md), [lights](docs/lights.md), [Wi-Fi](docs/wifi.md), [battery](docs/battery.md)) |
-| [patches/](patches/) | kernel patches on top of the base project's series (DRM, BPF, the sensor hub driver, battery status) |
-| [dts/](dts/) | device tree additions, included by the base project's boards: the sensor hub (SPI, GPIOs, power), the RGB LED, battery status |
+| [docs/](docs/) | one page per hardware service brought up: hardware, kernel, HAL, testing, what it took ([sensors](docs/sensors.md), [lights](docs/lights.md), [Wi-Fi](docs/wifi.md), [battery](docs/battery.md), [vibrator](docs/vibrator.md)) |
+| [patches/](patches/) | kernel patches on top of the base project's series (DRM, BPF, the sensor hub, battery status, vibrator) |
+| [dts/](dts/) | device tree additions, included by the base project's boards: the sensor hub (SPI, GPIOs, power), the RGB LED, battery status, the vibrator |
 | [rootfs/init](rootfs/init) | the ramdisk's first-stage init: USB network, rescue telnet, disks, watchdogs, BPF stand-in, wakelock |
 | [vendor/](vendor/) | `init.bullhead.rc`, `fstab.bullhead`, overlays (icon shape; LED and auto-brightness), the Wi-Fi init script |
-| [hal/](hal/) | our HALs, C++ on the stable binder NDK API: [sensors](hal/sensors/), [lights](hal/lights/) (built by [build-hal.main.kts](scripts/build-hal.main.kts)) |
+| [hal/](hal/) | our HALs, C++ on the stable binder NDK API: [sensors](hal/sensors/), [lights](hal/lights/), [vibrator](hal/vibrator/) (built by [build-hal.main.kts](scripts/build-hal.main.kts)) |
 | [apps/](apps/) | test apps on the public SDK API: [Sensor Test](apps/sensortest/), [Lights Test](apps/lightstest/) (built by [build-apps.main.kts](scripts/build-apps.main.kts)) |
 | [scripts/lib.main.kts](scripts/lib.main.kts) | what the scripts share: paths, running commands, the phone's telnet shell, fastboot |
 | [scripts/make-vendor.main.kts](scripts/make-vendor.main.kts) | emulator vendor image → bullhead vendor image (also builds the HWC shim) |
@@ -223,7 +225,7 @@ phone written; that's how the first boots were done.
 | [scripts/build-kernel.main.kts](scripts/build-kernel.main.kts), [build-bootimg.main.kts](scripts/build-bootimg.main.kts) | kernel and boot image |
 | [scripts/boot.main.kts](scripts/boot.main.kts), [watch-boot.main.kts](scripts/watch-boot.main.kts), [tsh.main.kts](scripts/tsh.main.kts) | boot with retries, stream the kernel log, run commands in the rescue shell |
 | [scripts/serve.main.kts](scripts/serve.main.kts), [backup-partition.main.kts](scripts/backup-partition.main.kts) | disks over NBD from the PC; raw partition backups with checksums |
-| [tools/phone/](tools/phone/) | the ramdisk's programs, one Kotlin/Native binary: `reboot-now`, `reboot-to`, `wait-power-key`, `bpf-map-stub`, `nanohub-test` |
+| [tools/phone/](tools/phone/) | the ramdisk's programs, one Kotlin/Native binary: `reboot-now`, `reboot-to`, `wait-power-key`, `bpf-map-stub`, `nanohub-test`, `vibrate` |
 | [tools/hwc-msm-shim.c](tools/hwc-msm-shim.c) | the composer's `LD_PRELOAD` shim (C: it lives inside an Android process) |
 
 Kernel patches are GPL-2.0, like the kernel they apply to.

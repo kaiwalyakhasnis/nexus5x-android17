@@ -16,6 +16,7 @@
 //   /vendor/lib64/libhwc_msm_shim.so       tools/hwc-msm-shim.c, built here
 //   /vendor/bin/hw/android.hardware.sensors-service  hal/sensors
 //   /vendor/bin/hw/android.hardware.lights-service.bullhead  hal/lights
+//   /vendor/bin/hw/android.hardware.vibrator-service.bullhead  hal/vibrator
 //                                          (scripts/build-hal.main.kts)
 //   /vendor/firmware/ath10k/, init.wifi.bullhead.rc  Wi-Fi (vendor/wifi): the
 //                                          emulator's Wi-Fi HAL/supplicant kept
@@ -72,6 +73,10 @@ val REMOVE = listOf(
     "apex/com.android.hardware.contexthub.apex",
     "apex/com.android.hardware.uwb.apex",
     "apex/com.android.hardware.threadnetwork-simulation-rcp.apex",
+    // the AOSP example vibrator (IVibrator V4, does nothing): hal/vibrator
+    // replaces it, and two IVibrator/default make the whole VINTF manifest
+    // invalid (Android then can't finish booting)
+    "apex/com.android.hardware.vibrator.apex",
 ) + listOf(
     "android.hardware.bluetooth_le.xml", "android.hardware.bluetooth.xml",
     "android.hardware.camera.concurrent.prebuilt.xml",
@@ -215,6 +220,7 @@ Files.move(tmpImg.toPath(), img.toPath(), java.nio.file.StandardCopyOption.REPLA
 val OUR_FILE_CONTEXTS = """
     |# nexus5x-android17 HALs (hal/)
     |/(vendor|system/vendor)/bin/hw/android\.hardware\.lights-service\.bullhead  u:object_r:hal_light_default_exec:s0
+    |/(vendor|system/vendor)/bin/hw/android\.hardware\.vibrator-service\.bullhead  u:object_r:hal_vibrator_default_exec:s0
     |""".trimMargin()
 val vendorFileContexts = debugfsRead(img, "/etc/selinux/vendor_file_contexts").decodeToString()
     .trimEnd('\n') + "\n\n" + OUR_FILE_CONTEXTS + "\n"
@@ -317,6 +323,12 @@ if (!lightsHal.isFile) die("no $lightsHal: run scripts/build-hal.main.kts")
 put(lightsHal, "/bin/hw/android.hardware.lights-service.bullhead", "100755".toInt(8), 2000)
 put(TOP.resolve("hal/lights/android.hardware.lights-service.bullhead.rc"), "/etc/init/android.hardware.lights-service.bullhead.rc")
 put(TOP.resolve("hal/lights/android.hardware.lights-service.bullhead.xml"), "/etc/vintf/manifest/android.hardware.lights-service.bullhead.xml")
+// the vibrator HAL (hal/vibrator): the PMI8994 haptics (kernel patches/0006)
+val vibratorHal = OUT.resolve("hal/android.hardware.vibrator-service.bullhead")
+if (!vibratorHal.isFile) die("no $vibratorHal: run scripts/build-hal.main.kts")
+put(vibratorHal, "/bin/hw/android.hardware.vibrator-service.bullhead", "100755".toInt(8), 2000)
+put(TOP.resolve("hal/vibrator/android.hardware.vibrator-service.bullhead.rc"), "/etc/init/android.hardware.vibrator-service.bullhead.rc")
+put(TOP.resolve("hal/vibrator/android.hardware.vibrator-service.bullhead.xml"), "/etc/vintf/manifest/android.hardware.vibrator-service.bullhead.xml")
 putText(vendorFileContexts, "/etc/selinux/vendor_file_contexts")
 // the sensor hub's device nodes (kernel patches/0004), for the HAL (system)
 putText(debugfsRead(img, "/etc/ueventd.rc").decodeToString() + """

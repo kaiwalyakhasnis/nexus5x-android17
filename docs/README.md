@@ -11,6 +11,7 @@ kernel and the vendor image fit together) and the build steps.
 | Lights (brightness slider, auto-brightness, notification LED) | [lights.md](lights.md) | ✅ |
 | Wi-Fi (QCA6174, 2.4 + 5 GHz) | [wifi.md](wifi.md) | ✅ scans, connects, internet |
 | Battery and charging (level, charging state, temperature zone) | [battery.md](battery.md) | ✅ level and state; ⚠️ charging only at USB 500 mA |
+| Vibrator (LRA motor: notifications, calls, touch feedback) | [vibrator.md](vibrator.md) | ✅ on/off, amplitude, click effects |
 
 ## Writing a new page
 

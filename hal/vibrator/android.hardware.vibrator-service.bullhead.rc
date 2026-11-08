@@ -1,0 +1,5 @@
+# the Nexus 5X vibrator HAL (hal/vibrator): the PMI8994 haptics input device
+service vendor.vibrator-bullhead /vendor/bin/hw/android.hardware.vibrator-service.bullhead
+    class hal
+    user system
+    group system input

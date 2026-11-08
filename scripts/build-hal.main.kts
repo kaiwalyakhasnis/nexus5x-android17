@@ -3,6 +3,7 @@
 //
 //   out/hal/android.hardware.sensors-service         hal/sensors (the nanohub)
 //   out/hal/android.hardware.lights-service.bullhead  hal/lights (backlight, LED)
+//   out/hal/android.hardware.vibrator-service.bullhead  hal/vibrator (the LRA motor)
 //
 // for make-vendor.main.kts to put in /vendor/bin/hw. How, without AOSP:
 //   - the interfaces (AIDL, frozen versions) and binder's C++ helper headers
@@ -32,13 +33,18 @@ val HAL_OUT = OUT.resolve("hal")
 // --- 1. AOSP sources: sparse, shallow clones of just what is needed
 fun fetch(name: String, repo: String, vararg paths: String) {
     val dir = AOSP.resolve(name)
-    if (dir.resolve(".git").isDirectory) return
-    AOSP.mkdirs()
-    run("git", "clone", "-q", "--filter=blob:none", "--sparse", "--depth", "1", "--branch", AOSP_TAG,
-        "https://android.googlesource.com/$repo", dir)
-    run("git", "-C", dir, "sparse-checkout", "set", "--no-cone", *paths)
+    if (!dir.resolve(".git").isDirectory) {
+        AOSP.mkdirs()
+        run("git", "clone", "-q", "--filter=blob:none", "--sparse", "--depth", "1", "--branch", AOSP_TAG,
+            "https://android.googlesource.com/$repo", dir)
+    }
+    // (again on an existing clone: a new HAL's paths get added)
+    val want = paths.joinToString("\n")
+    if (capture("git", "-C", dir, "sparse-checkout", "list").trim() != want)
+        run("git", "-C", dir, "sparse-checkout", "set", "--no-cone", *paths)
 }
-fetch("interfaces", "platform/hardware/interfaces", "/sensors/aidl", "/common/aidl", "/common/fmq/aidl", "/light/aidl")
+fetch("interfaces", "platform/hardware/interfaces", "/sensors/aidl", "/common/aidl", "/common/fmq/aidl",
+    "/light/aidl", "/vibrator/aidl")
 fetch("native", "platform/frameworks/native", "/libs/binder/ndk/include_cpp",
     "/libs/binder/ndk/include_platform", "/libs/binder/ndk/include_ndk")
 
@@ -85,6 +91,8 @@ fun build(name: String, binary: String, ifaces: List<Iface>) {
     // marks our binder VINTF-stable, or servicemanager refuses it
     val flags = listOf("-std=c++20", "-O2", "-Wall", "-Wno-unused-parameter", "-fPIE",
         "-D__ANDROID_VENDOR__", "-DBINDER_STABILITY_SUPPORT",
+        // the generated callbacks OR binder flags from two unnamed enums
+        "-Wno-deprecated-anon-enum-enum-conversion",
         "-I", gen.resolve("include").path,
         "-I", binder.resolve("include_cpp").path,
         "-I", binder.resolve("include_ndk").path,
@@ -105,3 +113,5 @@ val lightsIfaces = listOf(Iface(api.resolve("light/aidl/aidl_api/android.hardwar
 
 build("sensors", "android.hardware.sensors-service", sensorsIfaces)
 build("lights", "android.hardware.lights-service.bullhead", lightsIfaces)
+build("vibrator", "android.hardware.vibrator-service.bullhead",
+    listOf(Iface(api.resolve("vibrator/aidl/aidl_api/android.hardware.vibrator/1"), 1)))
