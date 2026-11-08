@@ -81,6 +81,39 @@ log "USB network up, telnet 172.16.42.1"
 	done
 ) &
 
+# Powered off with a cable in, LK starts this image anyway, with
+# androidboot.mode=charger (stock Android shows the battery there). Stay off
+# instead: no Android, backlight off (the PMIC charges by itself), telnet
+# still up. Holding power for a second starts Android; pulling the PC's cable
+# powers off. (No charger driver on this port, so a wall charger can't be
+# told from no cable: then it stays like this until power is held.)
+if grep -qw androidboot.mode=charger /proc/cmdline; then
+	log "charger mode: Android not started; hold power to start it"
+	# the msm display comes up a few seconds after this: keep it dark
+	(
+		for i in $(seq 1 30); do
+			for b in /sys/class/backlight/*; do
+				echo 0 > $b/brightness
+				echo 4 > $b/bl_power
+			done 2>/dev/null
+			sleep 1
+		done
+	) &
+	(
+		seen=0 miss=0
+		while sleep 2; do
+			if [ "$(cat /sys/class/udc/$UDC/state 2>/dev/null)" = configured ]; then
+				seen=1 miss=0
+			elif [ $seen = 1 ]; then
+				miss=$((miss + 1))
+				[ $miss -ge 5 ] && { log "charger mode: USB cable gone, powering off"; /sbin/reboot-now poweroff; }
+			fi
+		done
+	) &
+	/sbin/wait-power-key && { log "charger mode: power key held, starting Android"; /sbin/reboot-now normal; }
+	rescue "charger mode: no power key"
+fi
+
 # About 1 boot in 6 the RPM (SMD) does not answer (nexus5x-linux-6.12-wip
 # README): no RPM regulators, so no msm display/GPU (the panel keeps LK's
 # Google logo), and Android can't draw. Rebooting from such a boot can hang,

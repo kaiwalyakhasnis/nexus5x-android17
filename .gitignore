@@ -4,6 +4,7 @@
 /out/
 /tools/android-ndk-*/
 /tools/venv/
+/tools/kotlinc/
 # raw partition backups of the phone (stock system/vendor): never commit
 /backup/
 /out-build-kernel.log

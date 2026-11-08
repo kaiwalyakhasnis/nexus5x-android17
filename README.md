@@ -41,7 +41,7 @@ smoother. [Gallery as a bubble](media/bubble-gallery.gif).*
 | ✅ | KeyMint, Gatekeeper, health, power, thermal, lights (software HALs) | from Google's Android 17 emulator vendor image |
 | ✅ | zram swap | half the RAM, compressed |
 | ✅ | Boots by itself | `boot`, `system`, `vendor`, `userdata` all flashed on the eMMC; no PC needed |
-| ⚠️ | Boot reliability | ~1 boot in 6 the RPM doesn't answer (base project's known issue), worse after button resets; the ramdisk detects it and restarts after 30 s (or `boot.sh` retries from the PC) |
+| ⚠️ | Boot reliability | ~1 boot in 6 the RPM doesn't answer (base project's known issue), worse after button resets; the ramdisk detects it and restarts after 30 s (or `boot.main.kts` retries from the PC) |
 | ❌ | Suspend | blocked with a wakelock: the phone never wakes from s2idle |
 | ❌ | Wi-Fi, Bluetooth, modem, audio, camera, sensors, GNSS, battery level, RTC | no HAL yet (emulator ones removed) |
 | ❌ | Hardware video codecs | software codecs only |
@@ -73,12 +73,12 @@ smoother. [Gallery as a bubble](media/bubble-gallery.gif).*
 * **The vendor image** is the vendor partition of Google's Android 17 arm64
   *emulator* image: the only prebuilt Android 17 vendor there is, with the same
   SELinux version (202604) as the GSI and pure-software HALs that work on any
-  hardware. [scripts/make-vendor.py](scripts/make-vendor.py) edits it with
+  hardware. [scripts/make-vendor.main.kts](scripts/make-vendor.main.kts) edits it with
   `debugfs` (no root needed) and labels every file it adds the way Android's
   file_contexts say: our init script and fstab, kernel modules, Mesa, the A420
   microcode, a circular-icon overlay, permissive SELinux domains, and it
   removes the emulator-only HALs (sensors, modem, GNSS, camera, ...).
-* **Mesa** ([scripts/build-mesa.sh](scripts/build-mesa.sh)): freedreno only,
+* **Mesa** ([scripts/build-mesa.main.kts](scripts/build-mesa.main.kts)): freedreno only,
   with the base project's Adreno 418 patch, `-Dplatforms=android
   -Dandroid-stub=true`, libdrm static. Buffers are described by u_gralloc's
   fallback path (one linear plane).
@@ -91,7 +91,7 @@ smoother. [Gallery as a bubble](media/bubble-gallery.gif).*
 ## What it took
 
 Each of these stopped the boot somewhere; most were found from the kernel log
-streamed over the USB network ([scripts/watch-boot.sh](scripts/watch-boot.sh)).
+streamed over the USB network ([scripts/watch-boot.main.kts](scripts/watch-boot.main.kts)).
 
 1. **apexd**: some APEX payloads are EROFS, and compressed APEXes are mounted
    through dm-verity (both modules).
@@ -115,7 +115,7 @@ streamed over the USB network ([scripts/watch-boot.sh](scripts/watch-boot.sh)).
 8. **GPU memory accounting**: Android 17 aborts system_server when the
    `gpuMem` BPF map is missing, and its program can't load here (its
    tracepoint is Android-kernel-only). The ramdisk pins an empty stand-in
-   ([tools/bpf-map-stub.c](tools/bpf-map-stub.c)), but only after bpfloader
+   ([tools/phone/BpfMapStub.kt](tools/phone/BpfMapStub.kt)), but only after bpfloader
    has finished: a map already there makes bpfloader fail, which reboots.
 9. **The A418 doesn't come back from runtime suspend** (GPU hang on resume,
    and it autosuspends after 66 ms): kept powered.
@@ -142,6 +142,11 @@ and `mkbootimg.py`; or set `BASE=`), the kernel.org 6.12.112 tarball and a
 static BusyBox from it (`TARBALL=`, `BUSYBOX=`), the Android SDK (aapt2,
 apksigner) and the ~5 GB of downloads below.
 
+The scripts and the ramdisk's tools are Kotlin: the scripts are Kotlin
+scripts (`*.main.kts`, run on the JVM) and the tools in `tools/phone/` are
+one static Kotlin/Native binary for arm64. Only `rootfs/init` (BusyBox `sh`)
+and the HWC shim (C) aren't.
+
 ```sh
 # downloads (not in git): accept the Android 17 GSI licence on
 # developer.android.com first
@@ -150,25 +155,32 @@ apksigner) and the ~5 GB of downloads below.
 #   downloads/mesa/mesa-26.0.3.tar.xz, tools/android-ndk-r28c (NDK)
 python3 -m venv tools/venv && tools/venv/bin/pip install meson ninja mako packaging pyyaml
 
-scripts/build-kernel.sh          # kernel + modules (out/kernel, out/modules)
-scripts/build-mesa.sh            # out/mesa/lib64/egl/*_mesa.so
-scripts/build-overlays.sh        # out/overlay/*.apk
-VENDOR_SIZE=248M scripts/make-vendor.py   # out/vendor.img, the partition's size
-scripts/build-bootimg.sh         # out/boot-android-rev-{10,101}.img
+# Kotlin 2.2.21: the compiler (for the scripts) in tools/kotlinc, and
+# Kotlin/Native (for tools/phone) in ~/.konan; a JDK 21 (8 works, slowly)
+curl -LO https://github.com/JetBrains/kotlin/releases/download/v2.2.21/kotlin-compiler-2.2.21.zip
+unzip -d tools kotlin-compiler-2.2.21.zip
+curl -L https://github.com/JetBrains/kotlin/releases/download/v2.2.21/kotlin-native-prebuilt-linux-x86_64-2.2.21.tar.gz | tar xz -C ~/.konan
+export PATH=$PWD/tools/kotlinc/bin:$PATH JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+
+scripts/build-kernel.main.kts    # kernel + modules (out/kernel, out/modules)
+scripts/build-mesa.main.kts      # out/mesa/lib64/egl/*_mesa.so
+scripts/build-overlays.main.kts  # out/overlay/*.apk
+VENDOR_SIZE=248M scripts/make-vendor.main.kts   # out/vendor.img, the partition's size
+scripts/build-bootimg.main.kts   # out/boot-android-rev-{10,101}.img (+ tools/phone)
 
 # once: flash system, vendor, userdata (back them up first:
-# scripts/backup-partition.sh, from the base project's BusyBox boot)
+# scripts/backup-partition.main.kts, from the base project's BusyBox boot)
 fastboot flash boot    out/boot-android-rev-10.img  # or rev-101: fastboot getvar version-hardware
 fastboot flash system  downloads/gsi/extracted/system.img
 fastboot flash vendor  out/vendor.img
 fastboot flash userdata out/userdata.simg   # an empty ext4, 11771295744 bytes
 
-scripts/boot.sh                  # or, without flashing boot: fastboot boot, with retries
-adb connect 172.16.42.1:5555     # telnet 172.16.42.1 for a root shell
+scripts/boot.main.kts            # or, without flashing boot: fastboot boot, with retries
+adb connect 172.16.42.1:5555     # scripts/tsh.main.kts 'cmd' (or telnet 172.16.42.1) for a root shell
 ```
 
 `android.disks=nbd` on the kernel command line serves system/vendor/data from
-the PC instead ([scripts/serve.sh](scripts/serve.sh)), with nothing on the
+the PC instead ([scripts/serve.main.kts](scripts/serve.main.kts)), with nothing on the
 phone written; that's how the first boots were done.
 
 ## Layout
@@ -179,11 +191,13 @@ phone written; that's how the first boots were done.
 | [patches/](patches/) | three kernel patches on top of the base project's series |
 | [rootfs/init](rootfs/init) | the ramdisk's first-stage init: USB network, rescue telnet, disks, watchdogs, BPF stand-in, wakelock |
 | [vendor/](vendor/) | `init.bullhead.rc`, `fstab.bullhead`, the icon-shape overlay |
-| [scripts/make-vendor.py](scripts/make-vendor.py) | emulator vendor image → bullhead vendor image |
-| [scripts/build-mesa.sh](scripts/build-mesa.sh) | Mesa freedreno for Android with the NDK |
-| [scripts/build-kernel.sh](scripts/build-kernel.sh), [build-bootimg.sh](scripts/build-bootimg.sh) | kernel and boot image |
-| [scripts/boot.sh](scripts/boot.sh), [watch-boot.sh](scripts/watch-boot.sh), [tsh.sh](scripts/tsh.sh) | boot with retries, stream the kernel log, run commands in the rescue shell |
-| [scripts/serve.sh](scripts/serve.sh), [backup-partition.sh](scripts/backup-partition.sh) | disks over NBD from the PC; raw partition backups with checksums |
-| [tools/](tools/) | `bpf-map-stub.c`, `hwc-msm-shim.c`, `reboot-now.c` |
+| [scripts/lib.main.kts](scripts/lib.main.kts) | what the scripts share: paths, running commands, the phone's telnet shell, fastboot |
+| [scripts/make-vendor.main.kts](scripts/make-vendor.main.kts) | emulator vendor image → bullhead vendor image (also builds the HWC shim) |
+| [scripts/build-mesa.main.kts](scripts/build-mesa.main.kts) | Mesa freedreno for Android with the NDK |
+| [scripts/build-kernel.main.kts](scripts/build-kernel.main.kts), [build-bootimg.main.kts](scripts/build-bootimg.main.kts) | kernel and boot image |
+| [scripts/boot.main.kts](scripts/boot.main.kts), [watch-boot.main.kts](scripts/watch-boot.main.kts), [tsh.main.kts](scripts/tsh.main.kts) | boot with retries, stream the kernel log, run commands in the rescue shell |
+| [scripts/serve.main.kts](scripts/serve.main.kts), [backup-partition.main.kts](scripts/backup-partition.main.kts) | disks over NBD from the PC; raw partition backups with checksums |
+| [tools/phone/](tools/phone/) | the ramdisk's programs, one Kotlin/Native binary: `reboot-now`, `reboot-to`, `wait-power-key`, `bpf-map-stub` |
+| [tools/hwc-msm-shim.c](tools/hwc-msm-shim.c) | the composer's `LD_PRELOAD` shim (C: it lives inside an Android process) |
 
 Kernel patches are GPL-2.0, like the kernel they apply to.
