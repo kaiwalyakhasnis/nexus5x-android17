@@ -14,6 +14,8 @@
 //   /vendor/lib/modules/<kver>/            the =m kernel modules + modules.load
 //   /vendor/lib64/egl/                     Mesa (scripts/build-mesa.main.kts)
 //   /vendor/lib64/libhwc_msm_shim.so       tools/hwc-msm-shim.c, built here
+//   /vendor/bin/hw/android.hardware.sensors-service  hal/sensors
+//                                          (scripts/build-hal.main.kts)
 //   /vendor/overlay/                       scripts/build-overlays.main.kts
 //   /vendor/etc/selinux/vendor_sepolicy.cil  + typepermissive for every domain
 //   (precompiled_sepolicy removed: init compiles the policy at boot)
@@ -288,6 +290,21 @@ if (mesa.isDirectory) {
 }
 // the HWC3's drmGetVersion() shim (LD_PRELOAD, vendor/init.bullhead.rc)
 put(hwcShim(), "/lib64/libhwc_msm_shim.so")
+// the sensors HAL (hal/sensors, on the nanohub): this binary name already
+// has the hal_sensors_default label in the emulator's file_contexts
+val sensorsHal = OUT.resolve("hal/android.hardware.sensors-service")
+if (!sensorsHal.isFile) die("no $sensorsHal: run scripts/build-hal.main.kts")
+put(sensorsHal, "/bin/hw/android.hardware.sensors-service", "100755".toInt(8), 2000)
+put(TOP.resolve("hal/sensors/android.hardware.sensors-service.rc"), "/etc/init/android.hardware.sensors-service.rc")
+put(TOP.resolve("hal/sensors/android.hardware.sensors-service.xml"), "/etc/vintf/manifest/android.hardware.sensors-service.xml")
+put(TOP.resolve("hal/sensors/android.hardware.sensors.bullhead.xml"), "/etc/permissions/android.hardware.sensors.bullhead.xml")
+// the sensor hub's device nodes (kernel patches/0004), for the HAL (system)
+putText(debugfsRead(img, "/etc/ueventd.rc").decodeToString() + """
+    |
+    |# nexus5x-android17: the sensor hub (drivers/staging/nanohub)
+    |/dev/nanohub              0660   system     system
+    |/dev/nanohub_comms        0660   system     system
+    |""".trimMargin(), "/etc/ueventd.rc")
 // resource overlays: circular icons, ...
 OUT.resolve("overlay").listFiles { f -> f.name.endsWith(".apk") }?.sortedBy { it.name }?.forEach {
     put(it, "/overlay/${it.name}")

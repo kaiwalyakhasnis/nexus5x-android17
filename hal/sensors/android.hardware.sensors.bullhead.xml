@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Sensors the Nexus 5X has beyond the emulator's handheld_core_hardware.xml
+     (accelerometer, compass, gyroscope, barometer, light, proximity), and
+     the two of its sensors bullhead doesn't have. -->
+<permissions>
+    <feature name="android.hardware.sensor.stepcounter" />
+    <feature name="android.hardware.sensor.stepdetector" />
+    <unavailable-feature name="android.hardware.sensor.ambient_temperature" />
+    <unavailable-feature name="android.hardware.sensor.relative_humidity" />
+</permissions>

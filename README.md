@@ -38,12 +38,13 @@ smoother. [Gallery as a bubble](media/bubble-gallery.gif).*
 | ✅ | Display on the panel | the emulator's HWC3 in "client" mode on the msm MDP5 (KMS) |
 | ✅ | Touchscreen | mainline `rmi4` |
 | ✅ | adb (over the USB network), rescue root shell | `adb connect 172.16.42.1:5555`, `telnet 172.16.42.1` |
+| ✅ | Sensors: accelerometer, gyroscope, compass, barometer, light, proximity, steps, rotation vectors, gravity (16) | the nanohub on SPI: ported kernel driver + our NDK-built AIDL HAL; see [docs/sensors.md](docs/sensors.md) |
 | ✅ | KeyMint, Gatekeeper, health, power, thermal, lights (software HALs) | from Google's Android 17 emulator vendor image |
 | ✅ | zram swap | half the RAM, compressed |
 | ✅ | Boots by itself | `boot`, `system`, `vendor`, `userdata` all flashed on the eMMC; no PC needed |
 | ⚠️ | Boot reliability | ~1 boot in 6 the RPM doesn't answer (base project's known issue), worse after button resets; the ramdisk detects it and restarts after 30 s (or `boot.main.kts` retries from the PC) |
 | ❌ | Suspend | blocked with a wakelock: the phone never wakes from s2idle |
-| ❌ | Wi-Fi, Bluetooth, modem, audio, camera, sensors, GNSS, battery level, RTC | no HAL yet (emulator ones removed) |
+| ❌ | Wi-Fi, Bluetooth, modem, audio, camera, GNSS, battery level, RTC, notification LED | no HAL yet (emulator ones removed) |
 | ❌ | Hardware video codecs | software codecs only |
 
 ## How it fits together
@@ -139,13 +140,13 @@ streamed over the USB network ([scripts/watch-boot.main.kts](scripts/watch-boot.
 Needs, next to this repository, the base project checked out as
 `../nexus5x-linux-6.12-wip` (its patches, DTS, kernel config, BusyBox build
 and `mkbootimg.py`; or set `BASE=`), the kernel.org 6.12.112 tarball and a
-static BusyBox from it (`TARBALL=`, `BUSYBOX=`), the Android SDK (aapt2,
-apksigner) and the ~5 GB of downloads below.
+static BusyBox from it (`TARBALL=`, `BUSYBOX=`), the Android SDK (build-tools:
+aapt2, apksigner, aidl, d8) and the ~5 GB of downloads below.
 
 The scripts and the ramdisk's tools are Kotlin: the scripts are Kotlin
 scripts (`*.main.kts`, run on the JVM) and the tools in `tools/phone/` are
-one static Kotlin/Native binary for arm64. Only `rootfs/init` (BusyBox `sh`)
-and the HWC shim (C) aren't.
+one static Kotlin/Native binary for arm64. Only `rootfs/init` (BusyBox `sh`),
+the HWC shim (C) and the HALs in `hal/` (C++, they live in Android) aren't.
 
 ```sh
 # downloads (not in git): accept the Android 17 GSI licence on
@@ -165,6 +166,7 @@ export PATH=$PWD/tools/kotlinc/bin:$PATH JAVA_HOME=/usr/lib/jvm/java-21-openjdk-
 scripts/build-kernel.main.kts    # kernel + modules (out/kernel, out/modules)
 scripts/build-mesa.main.kts      # out/mesa/lib64/egl/*_mesa.so
 scripts/build-overlays.main.kts  # out/overlay/*.apk
+scripts/build-hal.main.kts       # out/hal/: the sensors HAL (SDK aidl + NDK; fetches ~7 MB of AOSP)
 VENDOR_SIZE=248M scripts/make-vendor.main.kts   # out/vendor.img, the partition's size
 scripts/build-bootimg.main.kts   # out/boot-android-rev-{10,101}.img (+ tools/phone)
 
@@ -177,7 +179,13 @@ fastboot flash userdata out/userdata.simg   # an empty ext4, 11771295744 bytes
 
 scripts/boot.main.kts            # or, without flashing boot: fastboot boot, with retries
 adb connect 172.16.42.1:5555     # scripts/tsh.main.kts 'cmd' (or telnet 172.16.42.1) for a root shell
+
+scripts/build-apps.main.kts      # test apps: out/apps/SensorTest.apk (SDK only, no Gradle)
+adb install -r out/apps/SensorTest.apk
 ```
+
+The boot and vendor images go together: the vendor image's sensors HAL
+expects the kernel's hub driver (`/dev/nanohub`).
 
 `android.disks=nbd` on the kernel command line serves system/vendor/data from
 the PC instead ([scripts/serve.main.kts](scripts/serve.main.kts)), with nothing on the
@@ -188,16 +196,20 @@ phone written; that's how the first boots were done.
 | Path | What it is |
 |---|---|
 | [config/android.config](config/android.config) | Android's kernel options, on top of the base project's `kernel.config` |
-| [patches/](patches/) | three kernel patches on top of the base project's series |
+| [docs/](docs/) | one page per hardware service brought up: hardware, kernel, HAL, testing, what it took ([sensors](docs/sensors.md)) |
+| [patches/](patches/) | kernel patches on top of the base project's series (DRM, BPF, the sensor hub driver) |
+| [dts/](dts/) | device tree additions, included by the base project's boards (the sensor hub: SPI, GPIOs, power) |
 | [rootfs/init](rootfs/init) | the ramdisk's first-stage init: USB network, rescue telnet, disks, watchdogs, BPF stand-in, wakelock |
 | [vendor/](vendor/) | `init.bullhead.rc`, `fstab.bullhead`, the icon-shape overlay |
+| [hal/](hal/) | our HALs, C++ on the stable binder NDK API: [sensors](hal/sensors/) (built by [build-hal.main.kts](scripts/build-hal.main.kts)) |
+| [apps/](apps/) | test apps on the public SDK API: [Sensor Test](apps/sensortest/) (built by [build-apps.main.kts](scripts/build-apps.main.kts)) |
 | [scripts/lib.main.kts](scripts/lib.main.kts) | what the scripts share: paths, running commands, the phone's telnet shell, fastboot |
 | [scripts/make-vendor.main.kts](scripts/make-vendor.main.kts) | emulator vendor image → bullhead vendor image (also builds the HWC shim) |
 | [scripts/build-mesa.main.kts](scripts/build-mesa.main.kts) | Mesa freedreno for Android with the NDK |
 | [scripts/build-kernel.main.kts](scripts/build-kernel.main.kts), [build-bootimg.main.kts](scripts/build-bootimg.main.kts) | kernel and boot image |
 | [scripts/boot.main.kts](scripts/boot.main.kts), [watch-boot.main.kts](scripts/watch-boot.main.kts), [tsh.main.kts](scripts/tsh.main.kts) | boot with retries, stream the kernel log, run commands in the rescue shell |
 | [scripts/serve.main.kts](scripts/serve.main.kts), [backup-partition.main.kts](scripts/backup-partition.main.kts) | disks over NBD from the PC; raw partition backups with checksums |
-| [tools/phone/](tools/phone/) | the ramdisk's programs, one Kotlin/Native binary: `reboot-now`, `reboot-to`, `wait-power-key`, `bpf-map-stub` |
+| [tools/phone/](tools/phone/) | the ramdisk's programs, one Kotlin/Native binary: `reboot-now`, `reboot-to`, `wait-power-key`, `bpf-map-stub`, `nanohub-test` |
 | [tools/hwc-msm-shim.c](tools/hwc-msm-shim.c) | the composer's `LD_PRELOAD` shim (C: it lives inside an Android process) |
 
 Kernel patches are GPL-2.0, like the kernel they apply to.
