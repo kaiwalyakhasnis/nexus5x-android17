@@ -96,9 +96,9 @@ run("cp", BASE.resolve("rootfs/usr/share/learn/usb-gadget.sh"), STAGE.resolve("u
 run("cp", BASE.resolve("rootfs/etc/udhcpd.conf"), STAGE.resolve("etc/"))
 run("cp", BUSYBOX, STAGE.resolve("bin/busybox"))
 link("busybox", STAGE.resolve("bin/sh"))
-// tools/phone: reboot-now, reboot-to, wait-power-key, bpf-map-stub
+// tools/phone: reboot-now, reboot-to, wait-power-key, bpf-map-stub, nanohub-test
 run("cp", tools, STAGE.resolve("sbin/bullhead-tools"))
-for (p in listOf("reboot-now", "reboot-to", "wait-power-key", "bpf-map-stub"))
+for (p in listOf("reboot-now", "reboot-to", "wait-power-key", "bpf-map-stub", "nanohub-test"))
     link("bullhead-tools", STAGE.resolve("sbin/$p"))
 // The A418's microcode (the A420's, from linux-firmware): drm/msm is built in
 // and asks for it while probing, before /vendor exists

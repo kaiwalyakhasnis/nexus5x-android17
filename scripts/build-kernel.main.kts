@@ -54,8 +54,16 @@ git("reset", "-q", "--hard", "base")
 git("clean", "-qfd")
 git("am", "-q", *patchesIn(BASE.resolve("patches")).toTypedArray())
 patchesIn(TOP.resolve("patches")).takeIf { it.isNotEmpty() }?.let { git("am", "-q", *it.toTypedArray()) }
+val DTS_DIR = KSRC.resolve("arch/arm64/boot/dts/qcom")
 BASE.resolve("dts").listFiles { f -> f.name.contains(".dts") }!!.forEach {
-    it.copyTo(KSRC.resolve("arch/arm64/boot/dts/qcom/${it.name}"), overwrite = true)
+    it.copyTo(DTS_DIR.resolve(it.name), overwrite = true)
+}
+// this project's own DT additions (dts/*.dtsi, e.g. the sensor hub): copied
+// next to the base project's and included by its boards (*-learn.dts)
+val ourDtsi = TOP.resolve("dts").listFiles { f -> f.name.endsWith(".dtsi") }?.sortedBy { it.name } ?: emptyList()
+ourDtsi.forEach { it.copyTo(DTS_DIR.resolve(it.name), overwrite = true) }
+DTS_DIR.listFiles { f -> f.name.endsWith("-learn.dts") }!!.forEach { board ->
+    board.appendText(ourDtsi.joinToString("") { "#include \"${it.name}\"\n" })
 }
 
 // 2. config: defconfig + the two fragments

@@ -17,6 +17,7 @@ private val programs: Map<String, (List<String>) -> Int> = mapOf(
     "reboot-to" to ::rebootTo,
     "wait-power-key" to ::waitPowerKey,
     "bpf-map-stub" to ::bpfMapStub,
+    "nanohub-test" to ::nanohubTest,
 )
 
 fun main(args: Array<String>) {

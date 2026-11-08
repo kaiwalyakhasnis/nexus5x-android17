@@ -1,0 +1,1956 @@
+From 4e99ba4fc6f9c469e5eb7a89c361b74883c9c605 Mon Sep 17 00:00:00 2001
+From: kk <kaiwalyakhasnis57@gmail.com>
+Date: Sun, 8 Nov 2026 16:59:08 +0900
+Subject: [PATCH] staging: nanohub: the Nexus 5X sensor hub, data path only
+
+Port of the bullhead 3.10 kernel's drivers/staging/nanohub (Google's
+sensor hub driver: an STM32F411 on SPI running the nanohub firmware,
+with every sensor of the phone behind it) to 6.12, for the Android
+sensors HAL: /dev/nanohub (sensor events), /dev/nanohub_comms (app
+messages) and read-only sysfs queries plus a reset.
+
+Left out on purpose: the STM32 bootloader and the firmware/app download
+and erase paths. Nothing in this driver can write the hub's flash.
+
+Updated for 6.12: gpiod instead of gpio numbers (DT: hub-cs, nreset,
+boot0, wakeup, irq1[, irq2]-gpios), wakeup_source instead of Android
+wakelocks, a plain struct instead of an empty IIO device, sched_set_fifo,
+ktime_get_boottime_ns, wait_queue_entry. The hub start-up (unmasking its
+interrupt, up to ~10 s without an answer) moved from probe to the reader
+thread so an unresponsive hub can't hold up the boot.
+---
+ drivers/staging/Kconfig          |    2 +
+ drivers/staging/Makefile         |    1 +
+ drivers/staging/nanohub/Kconfig  |   11 +
+ drivers/staging/nanohub/Makefile |    3 +
+ drivers/staging/nanohub/comms.c  |  304 +++++++++
+ drivers/staging/nanohub/comms.h  |   92 +++
+ drivers/staging/nanohub/main.c   | 1012 ++++++++++++++++++++++++++++++
+ drivers/staging/nanohub/main.h   |  141 +++++
+ drivers/staging/nanohub/spi.c    |  289 +++++++++
+ 9 files changed, 1855 insertions(+)
+ create mode 100644 drivers/staging/nanohub/Kconfig
+ create mode 100644 drivers/staging/nanohub/Makefile
+ create mode 100644 drivers/staging/nanohub/comms.c
+ create mode 100644 drivers/staging/nanohub/comms.h
+ create mode 100644 drivers/staging/nanohub/main.c
+ create mode 100644 drivers/staging/nanohub/main.h
+ create mode 100644 drivers/staging/nanohub/spi.c
+
+diff --git a/drivers/staging/Kconfig b/drivers/staging/Kconfig
+index 7aa37f54a..c72928d5b 100644
+--- a/drivers/staging/Kconfig
++++ b/drivers/staging/Kconfig
+@@ -62,4 +62,6 @@ source "drivers/staging/fieldbus/Kconfig"
+ 
+ source "drivers/staging/vme_user/Kconfig"
+ 
++source "drivers/staging/nanohub/Kconfig"
++
+ endif # STAGING
+diff --git a/drivers/staging/Makefile b/drivers/staging/Makefile
+index 2e18fe5b7..e48499001 100644
+--- a/drivers/staging/Makefile
++++ b/drivers/staging/Makefile
+@@ -20,3 +20,4 @@ obj-$(CONFIG_GREYBUS)		+= greybus/
+ obj-$(CONFIG_BCM2835_VCHIQ)	+= vc04_services/
+ obj-$(CONFIG_XIL_AXIS_FIFO)	+= axis-fifo/
+ obj-$(CONFIG_FIELDBUS_DEV)     += fieldbus/
++obj-$(CONFIG_NANOHUB)		+= nanohub/
+diff --git a/drivers/staging/nanohub/Kconfig b/drivers/staging/nanohub/Kconfig
+new file mode 100644
+index 000000000..9f35e9f53
+--- /dev/null
++++ b/drivers/staging/nanohub/Kconfig
+@@ -0,0 +1,11 @@
++# SPDX-License-Identifier: GPL-2.0
++config NANOHUB
++	tristate "Nanohub sensor hub (Nexus 5X)"
++	depends on SPI && GPIOLIB && OF
++	help
++	  The Nexus 5X's sensor hub: an STM32 microcontroller on SPI running
++	  Google's nanohub firmware, behind which sit all the phone's sensors.
++	  Provides /dev/nanohub for the Android sensors HAL. Data path only:
++	  it never updates the hub's firmware.
++
++	  If in doubt, say N here.
+diff --git a/drivers/staging/nanohub/Makefile b/drivers/staging/nanohub/Makefile
+new file mode 100644
+index 000000000..32e836bda
+--- /dev/null
++++ b/drivers/staging/nanohub/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_NANOHUB) += nanohub.o
++nanohub-y := main.o comms.o spi.o
+diff --git a/drivers/staging/nanohub/comms.c b/drivers/staging/nanohub/comms.c
+new file mode 100644
+index 000000000..8c7df6d7a
+--- /dev/null
++++ b/drivers/staging/nanohub/comms.c
+@@ -0,0 +1,304 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2016 Google, Inc.
++ *
++ * The nanohub packet protocol: [sync][seq][reason][len][data][crc32],
++ * each request answered by an ACK and then the reply.
++ */
++
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/delay.h>
++#include <linux/jiffies.h>
++#include <linux/timekeeping.h>
++
++#include "main.h"
++#include "comms.h"
++
++#define READ_ACK_TIMEOUT_MS	10
++#define READ_MSG_TIMEOUT_MS	70
++
++static const uint32_t crc_table[] = {
++	0x00000000, 0x04C11DB7, 0x09823B6E, 0x0D4326D9,
++	0x130476DC, 0x17C56B6B, 0x1A864DB2, 0x1E475005,
++	0x2608EDB8, 0x22C9F00F, 0x2F8AD6D6, 0x2B4BCB61,
++	0x350C9B64, 0x31CD86D3, 0x3C8EA00A, 0x384FBDBD
++};
++
++static uint32_t crc32_word(uint32_t crc, uint32_t data, int cnt)
++{
++	int i;
++
++	crc = crc ^ data;
++	for (i = 0; i < cnt; i++)
++		crc = (crc << 4) ^ crc_table[crc >> 28];
++
++	return crc;
++}
++
++/* the STM32's CRC unit: CRC-32 (poly 0x04C11DB7) over 32-bit words */
++static uint32_t nanohub_crc32(const uint8_t *buffer, int length, uint32_t crc)
++{
++	uint32_t word;
++	int i;
++
++	for (i = 0; i < (length >> 2); i++) {
++		memcpy(&word, buffer + i * 4, sizeof(word));
++		crc = crc32_word(crc, word, 8);
++	}
++
++	/* zero pad last word if required */
++	if (length & 0x3) {
++		for (i *= 4, word = 0; i < length; i++)
++			word |= buffer[i] << ((i & 0x3) * 8);
++		crc = crc32_word(crc, word, 8);
++	}
++
++	return crc;
++}
++
++static struct nanohub_packet_pad *packet_alloc(gfp_t flags)
++{
++	int len = sizeof(struct nanohub_packet_pad) + MAX_UINT8 +
++		  sizeof(struct nanohub_packet_crc);
++	uint8_t *packet = kmalloc(len, flags);
++
++	if (packet)
++		memset(packet, 0xFF, len);
++	return (struct nanohub_packet_pad *)packet;
++}
++
++static int packet_create(struct nanohub_packet *packet, uint32_t seq,
++			 uint32_t reason, uint8_t len, const uint8_t *data,
++			 bool user)
++{
++	struct nanohub_packet_crc crc;
++	int ret = sizeof(struct nanohub_packet) + len +
++		  sizeof(struct nanohub_packet_crc);
++
++	packet->sync = COMMS_SYNC;
++	packet->seq = seq;
++	packet->reason = reason;
++	packet->len = len;
++	if (len > 0) {
++		if (user) {
++			if (copy_from_user(packet->data,
++					   (const void __user *)data, len))
++				ret = ERROR_NACK;
++		} else {
++			memcpy(packet->data, data, len);
++		}
++	}
++	crc.crc = nanohub_crc32((uint8_t *)packet,
++				sizeof(struct nanohub_packet) + len, ~0);
++	memcpy(&packet->data[len], &crc.crc, sizeof(struct nanohub_packet_crc));
++
++	return ret;
++}
++
++static int packet_verify(struct nanohub_packet *packet)
++{
++	struct nanohub_packet_crc crc;
++
++	crc.crc = nanohub_crc32((uint8_t *)packet,
++				sizeof(struct nanohub_packet) + packet->len, ~0);
++
++	return memcmp(&crc.crc, &packet->data[packet->len],
++		      sizeof(struct nanohub_packet_crc));
++}
++
++/* one complete, CRC-checked packet within ms, else ERROR_NACK */
++static int read_packet(struct nanohub_data *data,
++		       struct nanohub_packet *response, int timeout, int ms)
++{
++	int ret = ERROR_NACK;
++	const int max_size = sizeof(struct nanohub_packet) + MAX_UINT8 +
++			     sizeof(struct nanohub_packet_crc);
++	unsigned long end = jiffies + msecs_to_jiffies(ms);
++
++	while (time_before(jiffies, end)) {
++		ret = data->comms.read(data, (uint8_t *)response, max_size,
++				       timeout);
++		if (ret == 0 || ret < (int)sizeof(struct nanohub_packet) ||
++		    ret < (int)(sizeof(struct nanohub_packet) + response->len +
++				sizeof(struct nanohub_packet_crc))) {
++			/* nothing yet, or not all of it */
++			ret = ERROR_NACK;
++			continue;
++		} else if (ret != sizeof(struct nanohub_packet) +
++			   response->len + sizeof(struct nanohub_packet_crc)) {
++			ret = ERROR_NACK;	/* wrong length */
++		} else if (packet_verify(response) != 0) {
++			ret = ERROR_NACK;	/* bad crc */
++		}
++		break;
++	}
++
++	return ret;
++}
++
++static int get_reply(struct nanohub_data *data, struct nanohub_packet *response,
++		     uint32_t seq)
++{
++	int ret;
++
++	ret = read_packet(data, response, data->comms.timeout_ack,
++			  READ_ACK_TIMEOUT_MS);
++
++	if (ret >= 0 && response->seq == seq) {
++		if (response->reason == CMD_COMMS_ACK) {
++			if (response->len == sizeof(data->interrupts))
++				memcpy(data->interrupts, response->data,
++				       response->len);
++			ret = read_packet(data, response,
++					  data->comms.timeout_reply,
++					  READ_MSG_TIMEOUT_MS);
++			if (ret < 0)
++				ret = ERROR_NACK;
++		} else if (response->reason == CMD_COMMS_NACK) {
++			ret = ERROR_NACK;
++		} else if (response->reason == CMD_COMMS_BUSY) {
++			ret = ERROR_BUSY;
++		}
++
++		if (response->seq != seq)
++			ret = ERROR_NACK;
++	} else {
++		ret = ERROR_NACK;
++	}
++
++	return ret;
++}
++
++static int nanohub_comms_tx_rx(struct nanohub_data *data,
++			       struct nanohub_packet_pad *pad, int packet_size,
++			       uint32_t seq, uint8_t *rx, size_t rx_len)
++{
++	int ret;
++
++	ret = data->comms.write(data, (uint8_t *)&pad->packet, packet_size,
++				data->comms.timeout_write);
++
++	if (ret == packet_size) {
++		ret = get_reply(data, &pad->packet, seq);
++
++		if (ret >= 0) {
++			if (pad->packet.len > 0) {
++				if (pad->packet.len > rx_len) {
++					memcpy(rx, pad->packet.data, rx_len);
++					ret = rx_len;
++				} else {
++					memcpy(rx, pad->packet.data,
++					       pad->packet.len);
++					ret = pad->packet.len;
++				}
++			} else {
++				ret = 0;
++			}
++		}
++	} else {
++		ret = ERROR_NACK;
++	}
++
++	return ret;
++}
++
++/* CMD_COMMS_READ: the request carries the AP's boot time, for the hub to
++ * convert its own timestamps
++ */
++int nanohub_comms_rx_retrans_boottime(struct nanohub_data *data, uint32_t cmd,
++				      uint8_t *rx, size_t rx_len,
++				      int retrans_cnt, int retrans_delay)
++{
++	int packet_size = 0;
++	struct nanohub_packet_pad *pad = packet_alloc(GFP_KERNEL);
++	int ret;
++	uint32_t seq;
++	s64 boottime;
++
++	if (!pad)
++		return ERROR_NACK;
++
++	seq = data->comms.seq++;
++
++	do {
++		data->comms.open(data);
++		boottime = ktime_get_boottime_ns();
++		packet_size = packet_create(&pad->packet, seq, cmd,
++					    sizeof(boottime),
++					    (uint8_t *)&boottime, false);
++
++		ret = nanohub_comms_tx_rx(data, pad, packet_size, seq, rx,
++					  rx_len);
++
++		if (nanohub_wakeup_eom(data,
++				       (ret == ERROR_BUSY) ||
++				       (ret == ERROR_NACK && retrans_cnt >= 0)))
++			ret = -EFAULT;
++
++		data->comms.close(data);
++
++		if (ret == ERROR_NACK) {
++			retrans_cnt--;
++			if (retrans_cnt >= 0)
++				udelay(retrans_delay);
++		} else if (ret == ERROR_BUSY) {
++			usleep_range(100000, 200000);
++		}
++	} while ((ret == ERROR_BUSY)
++		 || (ret == ERROR_NACK && retrans_cnt >= 0));
++
++	kfree(pad);
++
++	return ret;
++}
++
++int nanohub_comms_tx_rx_retrans(struct nanohub_data *data, uint32_t cmd,
++				const uint8_t *tx, uint8_t tx_len,
++				uint8_t *rx, size_t rx_len, bool user,
++				int retrans_cnt, int retrans_delay)
++{
++	int packet_size = 0;
++	struct nanohub_packet_pad *pad = packet_alloc(GFP_KERNEL);
++	int ret;
++	uint32_t seq;
++
++	if (!pad)
++		return ERROR_NACK;
++
++	seq = data->comms.seq++;
++
++	do {
++		packet_size = packet_create(&pad->packet, seq, cmd, tx_len, tx,
++					    user);
++		if (packet_size < 0) {
++			ret = -EFAULT;
++			break;
++		}
++
++		data->comms.open(data);
++		ret = nanohub_comms_tx_rx(data, pad, packet_size, seq, rx,
++					  rx_len);
++
++		if (nanohub_wakeup_eom(data,
++				       (ret == ERROR_BUSY) ||
++				       (ret == ERROR_NACK && retrans_cnt >= 0)))
++			ret = -EFAULT;
++
++		data->comms.close(data);
++
++		if (ret == ERROR_NACK) {
++			retrans_cnt--;
++			if (retrans_cnt >= 0)
++				udelay(retrans_delay);
++		} else if (ret == ERROR_BUSY) {
++			usleep_range(100000, 200000);
++		}
++	} while ((ret == ERROR_BUSY)
++		 || (ret == ERROR_NACK && retrans_cnt >= 0));
++
++	kfree(pad);
++
++	return ret;
++}
+diff --git a/drivers/staging/nanohub/comms.h b/drivers/staging/nanohub/comms.h
+new file mode 100644
+index 000000000..704652bf7
+--- /dev/null
++++ b/drivers/staging/nanohub/comms.h
+@@ -0,0 +1,92 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2016 Google, Inc.
++ */
++
++#ifndef _NANOHUB_COMMS_H
++#define _NANOHUB_COMMS_H
++
++#include <linux/types.h>
++
++struct __packed nanohub_packet {
++	uint8_t sync;
++	uint32_t seq;
++	uint32_t reason;
++	uint8_t len;
++	uint8_t data[];
++};
++
++struct __packed nanohub_packet_pad {
++	uint8_t pad[3];
++	struct nanohub_packet packet;
++};
++
++struct __packed nanohub_packet_crc {
++	uint32_t crc;
++};
++
++struct nanohub_data;
++
++struct nanohub_comms {
++	uint32_t seq;
++	int timeout_write;
++	int timeout_ack;
++	int timeout_reply;
++	int (*open)(void *);
++	void (*close)(void *);
++	int (*write)(void *, uint8_t *, int, int);
++	int (*read)(void *, uint8_t *, int, int);
++
++	uint8_t *tx_buffer;
++	uint8_t *rx_buffer;
++};
++
++int nanohub_comms_rx_retrans_boottime(struct nanohub_data *, uint32_t,
++				      uint8_t *, size_t, int, int);
++int nanohub_comms_tx_rx_retrans(struct nanohub_data *, uint32_t,
++				const uint8_t *, uint8_t, uint8_t *, size_t,
++				bool, int, int);
++
++#define ERROR_NACK			-1
++#define ERROR_BUSY			-2
++
++#define MAX_UINT8			((1 << (8*sizeof(uint8_t))) - 1)
++
++#define COMMS_SYNC			0x31
++
++#define CMD_COMMS_ACK			0x00000000
++#define CMD_COMMS_NACK			0x00000001
++#define CMD_COMMS_BUSY			0x00000002
++
++#define CMD_COMMS_GET_OS_HW_VERSIONS	0x00001000
++#define CMD_COMMS_GET_APP_VERSIONS	0x00001001
++#define CMD_COMMS_QUERY_APP_INFO	0x00001002
++
++#define CMD_COMMS_CLR_GET_INTR		0x00001080
++#define CMD_COMMS_MASK_INTR		0x00001081
++#define CMD_COMMS_UNMASK_INTR		0x00001082
++#define CMD_COMMS_READ			0x00001090
++#define CMD_COMMS_WRITE			0x00001091
++
++/* a message from user space (the sensors HAL) to the hub */
++static inline int nanohub_comms_write(struct nanohub_data *data,
++				      const uint8_t __user *buffer,
++				      size_t buffer_len)
++{
++	uint8_t ret;
++
++	if (buffer_len > MAX_UINT8)
++		return -EINVAL;
++	if (nanohub_comms_tx_rx_retrans
++	    (data, CMD_COMMS_WRITE, (const uint8_t __force *)buffer,
++	     buffer_len, &ret, sizeof(ret), true, 10, 10) == sizeof(ret)) {
++		if (ret)
++			return buffer_len;
++		else
++			return 0;
++	} else {
++		return ERROR_NACK;
++	}
++}
++
++#endif
+diff --git a/drivers/staging/nanohub/main.c b/drivers/staging/nanohub/main.c
+new file mode 100644
+index 000000000..5eff36861
+--- /dev/null
++++ b/drivers/staging/nanohub/main.c
+@@ -0,0 +1,1012 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2016 Google, Inc.
++ *
++ * Nanohub core: the wakeup handshake with the hub (the AP pulls WAKEUP low,
++ * the hub answers on IRQ1), a reader thread that pulls the hub's events
++ * into /dev/nanohub (sensor events) and /dev/nanohub_comms (app messages),
++ * and writes from user space passed on to the hub. See main.h.
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/fs.h>
++#include <linux/uaccess.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/poll.h>
++#include <linux/list.h>
++#include <linux/vmalloc.h>
++#include <linux/spinlock.h>
++#include <linux/sched.h>
++#include <linux/kthread.h>
++#include <linux/spi/spi.h>
++
++#include "main.h"
++#include "comms.h"
++
++#define READ_QUEUE_DEPTH	10
++#define FIRST_SENSOR_EVENTID	0x00000200
++#define LAST_SENSOR_EVENTID	0x000002FF
++#define APP_TO_HOST_EVENTID	0x00000401
++#define OS_LOG_EVENTID		0x3B474F4C
++#define WAKEUP_INTERRUPT	1
++#define WAKEUP_TIMEOUT_MS	1000
++#define BOOT_DELAY_MS		700	/* the hub's firmware start after reset */
++
++extern struct spi_driver nanohub_spi_driver;
++
++static const struct class nanohub_class = {
++	.name = "nanohub",
++};
++static int major;
++
++enum {
++	ST_IDLE,
++	ST_ERROR,
++	ST_RUNNING
++};
++
++static inline bool nanohub_has_priority_lock_locked(struct nanohub_data *data)
++{
++	return  atomic_read(&data->wakeup_lock_cnt) >
++		atomic_read(&data->wakeup_cnt);
++}
++
++static inline void nanohub_notify_thread(struct nanohub_data *data)
++{
++	atomic_set(&data->kthread_run, 1);
++	/* wake_up implementation works as memory barrier */
++	wake_up_interruptible_sync(&data->kthread_wait);
++}
++
++static inline void nanohub_io_init(struct nanohub_io *io,
++				   struct nanohub_data *data,
++				   struct device *dev)
++{
++	init_waitqueue_head(&io->buf_wait);
++	INIT_LIST_HEAD(&io->buf_list);
++	io->data = data;
++	io->dev = dev;
++}
++
++static inline bool nanohub_io_has_buf(struct nanohub_io *io)
++{
++	return !list_empty(&io->buf_list);
++}
++
++static struct nanohub_buf *nanohub_io_get_buf(struct nanohub_io *io,
++					      bool wait)
++{
++	struct nanohub_buf *buf = NULL;
++	int ret;
++
++	spin_lock(&io->buf_wait.lock);
++	if (wait) {
++		ret = wait_event_interruptible_locked(io->buf_wait,
++						      nanohub_io_has_buf(io));
++		if (ret < 0) {
++			spin_unlock(&io->buf_wait.lock);
++			return ERR_PTR(ret);
++		}
++	}
++
++	if (nanohub_io_has_buf(io)) {
++		buf = list_first_entry(&io->buf_list, struct nanohub_buf, list);
++		list_del(&buf->list);
++	}
++	spin_unlock(&io->buf_wait.lock);
++
++	return buf;
++}
++
++static void nanohub_io_put_buf(struct nanohub_io *io,
++			       struct nanohub_buf *buf)
++{
++	bool was_empty;
++
++	spin_lock(&io->buf_wait.lock);
++	was_empty = !nanohub_io_has_buf(io);
++	list_add_tail(&buf->list, &io->buf_list);
++	spin_unlock(&io->buf_wait.lock);
++
++	if (was_empty) {
++		if (&io->data->free_pool == io)
++			nanohub_notify_thread(io->data);
++		else
++			wake_up_interruptible(&io->buf_wait);
++	}
++}
++
++static inline void mcu_wakeup_gpio_set_value(struct nanohub_data *data,
++					     int val)
++{
++	gpiod_set_value(data->wakeup_gpio, val);
++}
++
++static inline void mcu_wakeup_gpio_get_locked(struct nanohub_data *data,
++					      int priority_lock)
++{
++	atomic_inc(&data->wakeup_lock_cnt);
++	if (!priority_lock && atomic_inc_return(&data->wakeup_cnt) == 1 &&
++	    !nanohub_has_priority_lock_locked(data))
++		mcu_wakeup_gpio_set_value(data, 0);
++}
++
++static inline bool mcu_wakeup_gpio_put_locked(struct nanohub_data *data,
++					      int priority_lock)
++{
++	bool gpio_done = priority_lock ?
++			 atomic_read(&data->wakeup_cnt) == 0 :
++			 atomic_dec_and_test(&data->wakeup_cnt);
++	bool done = atomic_dec_and_test(&data->wakeup_lock_cnt);
++
++	if (!nanohub_has_priority_lock_locked(data))
++		mcu_wakeup_gpio_set_value(data, gpio_done ? 1 : 0);
++
++	return done;
++}
++
++static inline bool mcu_wakeup_gpio_is_locked(struct nanohub_data *data)
++{
++	return atomic_read(&data->wakeup_lock_cnt) != 0;
++}
++
++static inline void nanohub_handle_irq1(struct nanohub_data *data)
++{
++	bool locked;
++
++	spin_lock(&data->wakeup_wait.lock);
++	locked = mcu_wakeup_gpio_is_locked(data);
++	spin_unlock(&data->wakeup_wait.lock);
++	if (!locked)
++		nanohub_notify_thread(data);
++	else
++		wake_up_interruptible_sync(&data->wakeup_wait);
++}
++
++static inline void nanohub_handle_irq2(struct nanohub_data *data)
++{
++	nanohub_notify_thread(data);
++}
++
++static inline bool mcu_wakeup_try_lock(struct nanohub_data *data, int key)
++{
++	/* implementation contains memory barrier */
++	return atomic_cmpxchg(&data->wakeup_acquired, 0, key) == 0;
++}
++
++static inline void mcu_wakeup_unlock(struct nanohub_data *data, int key)
++{
++	WARN(atomic_cmpxchg(&data->wakeup_acquired, key, 0) != key,
++	     "%s: failed to unlock with key %d; current state: %d",
++	     __func__, key, atomic_read(&data->wakeup_acquired));
++}
++
++static inline void nanohub_set_state(struct nanohub_data *data, int state)
++{
++	atomic_set(&data->thread_state, state);
++	smp_mb__after_atomic(); /* updated thread state is now visible */
++}
++
++static inline int nanohub_get_state(struct nanohub_data *data)
++{
++	smp_mb__before_atomic(); /* wait for all updates to finish */
++	return atomic_read(&data->thread_state);
++}
++
++/* wait_event_interruptible_timeout() with q.lock held by the caller, as
++ * wait_event_interruptible_locked() does without a timeout
++ */
++#define wait_event_interruptible_timeout_locked(q, cond, tmo)		\
++({									\
++	long __ret = (tmo);						\
++	DEFINE_WAIT(__wait);						\
++	if (!(cond)) {							\
++		for (;;) {						\
++			__wait.flags &= ~WQ_FLAG_EXCLUSIVE;		\
++			if (list_empty(&__wait.entry))			\
++				__add_wait_queue_entry_tail(&(q), &__wait); \
++			set_current_state(TASK_INTERRUPTIBLE);		\
++			if ((cond))					\
++				break;					\
++			if (signal_pending(current)) {			\
++				__ret = -ERESTARTSYS;			\
++				break;					\
++			}						\
++			spin_unlock(&(q).lock);				\
++			__ret = schedule_timeout(__ret);		\
++			spin_lock(&(q).lock);				\
++			if (!__ret) {					\
++				if ((cond))				\
++					__ret = 1;			\
++				break;					\
++			}						\
++		}							\
++		__set_current_state(TASK_RUNNING);			\
++		if (!list_empty(&__wait.entry))				\
++			list_del_init(&__wait.entry);			\
++		else if (__ret == -ERESTARTSYS &&			\
++			 waitqueue_active(&(q)))			\
++			__wake_up_locked_key(&(q), TASK_INTERRUPTIBLE,	\
++					     NULL);			\
++	} else {							\
++		__ret = 1;						\
++	}								\
++	__ret;								\
++})
++
++int request_wakeup_ex(struct nanohub_data *data, long timeout_ms,
++		      int key, int lock_mode)
++{
++	long timeout;
++	bool priority_lock = lock_mode > LOCK_MODE_NORMAL;
++
++	spin_lock(&data->wakeup_wait.lock);
++	mcu_wakeup_gpio_get_locked(data, priority_lock);
++	timeout = (timeout_ms != MAX_SCHEDULE_TIMEOUT) ?
++		   msecs_to_jiffies(timeout_ms) :
++		   MAX_SCHEDULE_TIMEOUT;
++
++	timeout = wait_event_interruptible_timeout_locked(
++			data->wakeup_wait,
++			((priority_lock || nanohub_irq1_fired(data)) &&
++			 mcu_wakeup_try_lock(data, key)),
++			timeout
++		  );
++
++	if (timeout <= 0) {
++		mcu_wakeup_gpio_put_locked(data, priority_lock);
++
++		if (timeout == 0)
++			timeout = -ETIME;
++	} else {
++		timeout = 0;
++	}
++	spin_unlock(&data->wakeup_wait.lock);
++
++	return timeout;
++}
++
++void release_wakeup_ex(struct nanohub_data *data, int key, int lock_mode)
++{
++	bool done;
++	bool priority_lock = lock_mode > LOCK_MODE_NORMAL;
++
++	spin_lock(&data->wakeup_wait.lock);
++	done = mcu_wakeup_gpio_put_locked(data, priority_lock);
++	mcu_wakeup_unlock(data, key);
++	spin_unlock(&data->wakeup_wait.lock);
++
++	if (!done)
++		wake_up_interruptible_sync(&data->wakeup_wait);
++	else if (nanohub_irq1_fired(data) || nanohub_irq2_fired(data))
++		nanohub_notify_thread(data);
++}
++
++int nanohub_wait_for_interrupt(struct nanohub_data *data)
++{
++	int ret = -EFAULT;
++
++	/* release the wakeup line, and wait for nanohub to send
++	 * us an interrupt indicating the transaction completed.
++	 */
++	spin_lock(&data->wakeup_wait.lock);
++	if (mcu_wakeup_gpio_is_locked(data)) {
++		mcu_wakeup_gpio_set_value(data, 1);
++		ret = wait_event_interruptible_locked(data->wakeup_wait,
++						      nanohub_irq1_fired(data));
++		mcu_wakeup_gpio_set_value(data, 0);
++	}
++	spin_unlock(&data->wakeup_wait.lock);
++
++	return ret;
++}
++
++int nanohub_wakeup_eom(struct nanohub_data *data, bool repeat)
++{
++	int ret = -EFAULT;
++
++	spin_lock(&data->wakeup_wait.lock);
++	if (mcu_wakeup_gpio_is_locked(data)) {
++		mcu_wakeup_gpio_set_value(data, 1);
++		if (repeat)
++			mcu_wakeup_gpio_set_value(data, 0);
++		ret = 0;
++	}
++	spin_unlock(&data->wakeup_wait.lock);
++
++	return ret;
++}
++
++static void __nanohub_interrupt_cfg(struct nanohub_data *data,
++				    u8 interrupt, bool mask)
++{
++	int ret;
++	uint8_t mask_ret = 0;
++	int cnt = 10;
++	int cmd = mask ? CMD_COMMS_MASK_INTR : CMD_COMMS_UNMASK_INTR;
++
++	do {
++		ret = request_wakeup_timeout(data, WAKEUP_TIMEOUT_MS);
++		if (ret) {
++			dev_err(data->dev,
++				"%s: interrupt %d %smask failed: ret=%d\n",
++				__func__, interrupt, mask ? "" : "un", ret);
++			return;
++		}
++
++		ret = nanohub_comms_tx_rx_retrans(data, cmd,
++						  &interrupt, sizeof(interrupt),
++						  &mask_ret, sizeof(mask_ret),
++						  false, 10, 0);
++		release_wakeup(data);
++		dev_dbg(data->dev, "%smasking interrupt %d, ret=%d, mask_ret=%d\n",
++			mask ? "" : "un", interrupt, ret, mask_ret);
++	} while ((ret != 1 || mask_ret != 1) && --cnt > 0);
++}
++
++static inline void nanohub_unmask_interrupt(struct nanohub_data *data,
++					    u8 interrupt)
++{
++	__nanohub_interrupt_cfg(data, interrupt, false);
++}
++
++/* --- sysfs: read-only queries, and a reset (no firmware updates) */
++
++static ssize_t wakeup_show(struct device *dev, struct device_attribute *attr,
++			   char *buf)
++{
++	struct nanohub_data *data = dev_get_nanohub_data(dev);
++
++	data->err_cnt = 0;
++	if (nanohub_irq1_fired(data) || nanohub_irq2_fired(data))
++		wake_up_interruptible(&data->wakeup_wait);
++
++	return sysfs_emit(buf, "WAKEUP: %d INT1: %d INT2: %d\n",
++			  gpiod_get_value(data->wakeup_gpio),
++			  gpiod_get_value(data->irq1_gpio),
++			  data->irq2 ? gpiod_get_value(data->irq2_gpio) : -1);
++}
++
++static ssize_t app_info_show(struct device *dev, struct device_attribute *attr,
++			     char *buf)
++{
++	struct nanohub_data *data = dev_get_nanohub_data(dev);
++	struct {
++		uint64_t appId;
++		uint32_t appVer;
++		uint32_t appSize;
++	} __packed buffer;
++	uint32_t i = 0;
++	int ret;
++	ssize_t len = 0;
++
++	do {
++		if (request_wakeup_timeout(data, WAKEUP_TIMEOUT_MS))
++			return len ? len : -ETIME;
++
++		if (nanohub_comms_tx_rx_retrans
++		    (data, CMD_COMMS_QUERY_APP_INFO, (uint8_t *)&i,
++		     sizeof(i), (u8 *)&buffer, sizeof(buffer),
++		     false, 10, 10) == sizeof(buffer)) {
++			ret = scnprintf(buf + len, PAGE_SIZE - len,
++					"app: %d id: %016llx ver: %08x size: %08x\n",
++					i, buffer.appId, buffer.appVer,
++					buffer.appSize);
++			if (ret > 0) {
++				len += ret;
++				i++;
++			}
++		} else {
++			ret = -1;
++		}
++
++		release_wakeup(data);
++	} while (ret > 0);
++
++	return len;
++}
++
++/* hw type, hw ver, bl ver, os ver, variant (2 words) */
++static int nanohub_get_versions(struct nanohub_data *data, uint16_t ver[6])
++{
++	int ret;
++
++	if (request_wakeup_timeout(data, WAKEUP_TIMEOUT_MS))
++		return -ETIME;
++	ret = nanohub_comms_tx_rx_retrans(data, CMD_COMMS_GET_OS_HW_VERSIONS,
++					  NULL, 0, (uint8_t *)ver,
++					  6 * sizeof(uint16_t), false, 10, 10);
++	release_wakeup(data);
++
++	return ret == 6 * sizeof(uint16_t) ? 0 : -EIO;
++}
++
++static ssize_t firmware_version_show(struct device *dev,
++				     struct device_attribute *attr, char *buf)
++{
++	struct nanohub_data *data = dev_get_nanohub_data(dev);
++	uint16_t v[6];
++	int ret;
++
++	ret = nanohub_get_versions(data, v);
++	if (ret)
++		return ret;
++
++	return sysfs_emit(buf, "hw type: %04x hw ver: %04x bl ver: %04x os ver: %04x variant ver: %08x\n",
++			  v[0], v[1], v[2], v[3], v[5] << 16 | v[4]);
++}
++
++static void __nanohub_hw_reset(struct nanohub_data *data)
++{
++	gpiod_set_value(data->nreset_gpio, 0);
++	gpiod_set_value(data->boot0_gpio, 0);	/* run the firmware */
++	usleep_range(30, 40);
++	gpiod_set_value(data->nreset_gpio, 1);
++	msleep(BOOT_DELAY_MS);
++}
++
++static ssize_t reset_store(struct device *dev, struct device_attribute *attr,
++			   const char *buf, size_t count)
++{
++	struct nanohub_data *data = dev_get_nanohub_data(dev);
++	int ret;
++
++	disable_irq(data->irq1);
++	ret = request_wakeup_ex(data, WAKEUP_TIMEOUT_MS, KEY_WAKEUP_LOCK,
++				LOCK_MODE_RESET);
++	if (!ret) {
++		data->err_cnt = 0;
++		__nanohub_hw_reset(data);
++		release_wakeup_ex(data, KEY_WAKEUP_LOCK, LOCK_MODE_RESET);
++	}
++	enable_irq(data->irq1);
++	if (!data->irq2)
++		nanohub_unmask_interrupt(data, 2);
++	nanohub_notify_thread(data);
++
++	return ret < 0 ? ret : count;
++}
++
++static DEVICE_ATTR_RO(wakeup);
++static DEVICE_ATTR_RO(app_info);
++static DEVICE_ATTR_RO(firmware_version);
++static DEVICE_ATTR_WO(reset);
++
++static struct attribute *nanohub_attrs[] = {
++	&dev_attr_wakeup.attr,
++	&dev_attr_app_info.attr,
++	&dev_attr_firmware_version.attr,
++	&dev_attr_reset.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(nanohub);
++
++/* --- /dev/nanohub, /dev/nanohub_comms */
++
++static int nanohub_match_devt(struct device *dev, const void *data)
++{
++	const dev_t *devt = data;
++
++	return dev->devt == *devt;
++}
++
++static int nanohub_open(struct inode *inode, struct file *file)
++{
++	dev_t devt = inode->i_rdev;
++	struct device *dev;
++
++	dev = class_find_device(&nanohub_class, NULL, &devt, nanohub_match_devt);
++	if (dev) {
++		file->private_data = dev_get_drvdata(dev);
++		put_device(dev);
++		nonseekable_open(inode, file);
++		return 0;
++	}
++
++	return -ENODEV;
++}
++
++static ssize_t nanohub_read(struct file *file, char __user *buffer,
++			    size_t length, loff_t *offset)
++{
++	struct nanohub_io *io = file->private_data;
++	struct nanohub_data *data = io->data;
++	struct nanohub_buf *buf;
++	int ret;
++
++	if (!nanohub_io_has_buf(io) && (file->f_flags & O_NONBLOCK))
++		return -EAGAIN;
++
++	buf = nanohub_io_get_buf(io, true);
++	if (IS_ERR_OR_NULL(buf))
++		return PTR_ERR(buf);
++
++	if (length < buf->length)
++		ret = -EINVAL;
++	else if (copy_to_user(buffer, buf->buffer, buf->length))
++		ret = -EFAULT;
++	else
++		ret = buf->length;
++
++	nanohub_io_put_buf(&data->free_pool, buf);
++
++	return ret;
++}
++
++static ssize_t nanohub_write(struct file *file, const char __user *buffer,
++			     size_t length, loff_t *offset)
++{
++	struct nanohub_io *io = file->private_data;
++	struct nanohub_data *data = io->data;
++	int ret;
++
++	ret = request_wakeup_timeout(data, WAKEUP_TIMEOUT_MS);
++	if (ret)
++		return ret;
++
++	ret = nanohub_comms_write(data, (const uint8_t __user *)buffer, length);
++
++	release_wakeup(data);
++
++	return ret;
++}
++
++static __poll_t nanohub_poll(struct file *file, poll_table *wait)
++{
++	struct nanohub_io *io = file->private_data;
++	__poll_t mask = EPOLLOUT | EPOLLWRNORM;
++
++	poll_wait(file, &io->buf_wait, wait);
++
++	if (nanohub_io_has_buf(io))
++		mask |= EPOLLIN | EPOLLRDNORM;
++
++	return mask;
++}
++
++static int nanohub_release(struct inode *inode, struct file *file)
++{
++	file->private_data = NULL;
++
++	return 0;
++}
++
++static const struct file_operations nanohub_fileops = {
++	.owner = THIS_MODULE,
++	.open = nanohub_open,
++	.read = nanohub_read,
++	.write = nanohub_write,
++	.poll = nanohub_poll,
++	.release = nanohub_release,
++};
++
++static int nanohub_create_devices(struct nanohub_data *data)
++{
++	int i, ret;
++	static const char * const names[ID_NANOHUB_MAX] = {
++			"nanohub", "nanohub_comms"
++	};
++
++	for (i = 0; i < ID_NANOHUB_MAX; ++i) {
++		struct nanohub_io *io = &data->io[i];
++		struct device *dev;
++
++		/* ready before the device node appears */
++		nanohub_io_init(io, data, NULL);
++		/* the sysfs attributes go on the sensor device */
++		dev = device_create_with_groups(&nanohub_class, data->dev,
++						MKDEV(major, i), io,
++						i == ID_NANOHUB_SENSOR ?
++						nanohub_groups : NULL,
++						names[i]);
++		if (IS_ERR(dev)) {
++			ret = PTR_ERR(dev);
++			dev_err(data->dev, "device_create failed for %s; err=%d\n",
++				names[i], ret);
++			goto fail_dev;
++		}
++		io->dev = dev;
++	}
++
++	return 0;
++
++fail_dev:
++	for (--i; i >= 0; --i)
++		device_destroy(&nanohub_class, MKDEV(major, i));
++	return ret;
++}
++
++static void nanohub_destroy_devices(struct nanohub_data *data)
++{
++	int i;
++
++	for (i = 0; i < ID_NANOHUB_MAX; ++i)
++		device_destroy(&nanohub_class, MKDEV(major, i));
++}
++
++static irqreturn_t nanohub_irq1(int irq, void *dev_id)
++{
++	nanohub_handle_irq1(dev_id);
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t nanohub_irq2(int irq, void *dev_id)
++{
++	nanohub_handle_irq2(dev_id);
++	return IRQ_HANDLED;
++}
++
++/* the hub's own log lines, into the kernel log */
++static bool nanohub_os_log(char *buffer, int len)
++{
++	if ((le32_to_cpu(((uint32_t *)buffer)[0]) & 0x7FFFFFFF) ==
++	    OS_LOG_EVENTID) {
++		char *mtype, *mdata = &buffer[5];
++
++		buffer[min(len, 254)] = 0x00;
++
++		switch (buffer[4]) {
++		case 'E':
++			mtype = KERN_ERR;
++			break;
++		case 'W':
++			mtype = KERN_WARNING;
++			break;
++		case 'I':
++			mtype = KERN_INFO;
++			break;
++		case 'D':
++			mtype = KERN_DEBUG;
++			break;
++		default:
++			mtype = KERN_DEFAULT;
++			mdata--;
++			break;
++		}
++		printk("%snanohub: %s", mtype, mdata);
++		return true;
++	} else {
++		return false;
++	}
++}
++
++static void nanohub_process_buffer(struct nanohub_data *data,
++				   struct nanohub_buf **buf,
++				   int ret)
++{
++	uint32_t event_id;
++	uint8_t interrupt;
++	bool wakeup = false;
++	struct nanohub_io *io = &data->io[ID_NANOHUB_SENSOR];
++
++	data->err_cnt = 0;
++	if (ret < 4 || nanohub_os_log((*buf)->buffer, ret)) {
++		release_wakeup(data);
++		return;
++	}
++
++	(*buf)->length = ret;
++
++	event_id = le32_to_cpu(((uint32_t *)(*buf)->buffer)[0]) & 0x7FFFFFFF;
++	if (ret >= sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint32_t) &&
++	    event_id > FIRST_SENSOR_EVENTID &&
++	    event_id <= LAST_SENSOR_EVENTID) {
++		interrupt = (*buf)->buffer[sizeof(uint32_t) +
++					   sizeof(uint64_t) + 3];
++		if (interrupt == WAKEUP_INTERRUPT)
++			wakeup = true;
++	}
++	if (event_id == APP_TO_HOST_EVENTID) {
++		wakeup = true;
++		io = &data->io[ID_NANOHUB_COMMS];
++	}
++
++	nanohub_io_put_buf(io, *buf);
++
++	*buf = NULL;
++	/* (for wakeup interrupts): hold a wake lock for 250ms so the sensor hal
++	 * has time to grab its own wake lock
++	 */
++	if (wakeup)
++		__pm_wakeup_event(data->ws_read, 250);
++	release_wakeup(data);
++}
++
++/* the hub's firmware is running (nreset was high since probe, or LK left it
++ * running): take its interrupts. Here and not in probe, as the unmask can
++ * take ~10 s when the hub does not answer.
++ */
++static void nanohub_start(struct nanohub_data *data)
++{
++	uint16_t v[6];
++
++	msleep(BOOT_DELAY_MS);
++	enable_irq(data->irq1);
++	if (data->irq2)
++		enable_irq(data->irq2);
++	else
++		nanohub_unmask_interrupt(data, 2);
++
++	if (nanohub_get_versions(data, v) == 0)
++		dev_info(data->dev, "hub: hw type %04x ver %04x, bl %04x, os %04x, variant %08x\n",
++			 v[0], v[1], v[2], v[3], v[5] << 16 | v[4]);
++	else
++		dev_warn(data->dev, "no answer from the hub (powered? see the DT)\n");
++}
++
++static int nanohub_kthread(void *arg)
++{
++	struct nanohub_data *data = (struct nanohub_data *)arg;
++	struct nanohub_buf *buf = NULL;
++	int ret;
++	uint32_t clear_interrupts[8] = { 0x00000006 };
++
++	sched_set_fifo(current);
++	nanohub_start(data);
++
++	data->err_cnt = 0;
++	nanohub_set_state(data, ST_IDLE);
++
++	while (!kthread_should_stop()) {
++		switch (nanohub_get_state(data)) {
++		case ST_IDLE:
++			wait_event_interruptible(data->kthread_wait,
++						 atomic_read(&data->kthread_run) ||
++						 kthread_should_stop());
++			nanohub_set_state(data, ST_RUNNING);
++			break;
++		case ST_ERROR:
++			msleep_interruptible(WAKEUP_TIMEOUT_MS);
++			nanohub_set_state(data, ST_RUNNING);
++			break;
++		case ST_RUNNING:
++			break;
++		}
++		if (kthread_should_stop())
++			break;
++		atomic_set(&data->kthread_run, 0);
++		if (!buf)
++			buf = nanohub_io_get_buf(&data->free_pool,
++						 false);
++		if (buf) {
++			ret = request_wakeup_timeout(data, WAKEUP_TIMEOUT_MS);
++			if (ret) {
++				dev_info_ratelimited(data->dev,
++					 "%s: request_wakeup_timeout: ret=%d\n",
++					 __func__, ret);
++				if (++data->err_cnt >= 10)
++					nanohub_set_state(data, ST_ERROR);
++				continue;
++			}
++
++			ret = nanohub_comms_rx_retrans_boottime(
++			    data, CMD_COMMS_READ, buf->buffer,
++			    sizeof(buf->buffer), 10, 0);
++
++			if (ret > 0) {
++				nanohub_process_buffer(data, &buf, ret);
++				if (!nanohub_irq1_fired(data) &&
++				    !nanohub_irq2_fired(data)) {
++					nanohub_set_state(data, ST_IDLE);
++					continue;
++				}
++			} else if (ret == 0) {
++				/* queue empty, go to sleep */
++				data->err_cnt = 0;
++				data->interrupts[0] &= ~0x00000006;
++				release_wakeup(data);
++				nanohub_set_state(data, ST_IDLE);
++				continue;
++			} else {
++				release_wakeup(data);
++				if (++data->err_cnt >= 10) {
++					dev_err(data->dev, "%s: err_cnt=%d\n",
++						__func__, data->err_cnt);
++					nanohub_set_state(data, ST_ERROR);
++					continue;
++				}
++			}
++		} else {
++			if (!nanohub_irq1_fired(data) &&
++			    !nanohub_irq2_fired(data)) {
++				nanohub_set_state(data, ST_IDLE);
++				continue;
++			}
++			/* pending interrupt, but no room to read data -
++			 * clear interrupts
++			 */
++			if (request_wakeup_timeout(data, WAKEUP_TIMEOUT_MS))
++				continue;
++			nanohub_comms_tx_rx_retrans(data,
++						    CMD_COMMS_CLR_GET_INTR,
++						    (uint8_t *)clear_interrupts,
++						    sizeof(clear_interrupts),
++						    (uint8_t *)data->interrupts,
++						    sizeof(data->interrupts),
++						    false, 10, 0);
++			release_wakeup(data);
++			nanohub_set_state(data, ST_IDLE);
++		}
++	}
++
++	if (buf)
++		nanohub_io_put_buf(&data->free_pool, buf);
++	return 0;
++}
++
++static int nanohub_request_irqs(struct nanohub_data *data)
++{
++	int ret;
++
++	ret = devm_request_threaded_irq(data->dev, data->irq1, NULL,
++					nanohub_irq1,
++					IRQF_TRIGGER_FALLING | IRQF_ONESHOT |
++					IRQF_NO_AUTOEN, "nanohub-irq1", data);
++	if (ret < 0)
++		return dev_err_probe(data->dev, ret, "irq1\n");
++
++	if (data->irq2 > 0) {
++		ret = devm_request_threaded_irq(data->dev, data->irq2, NULL,
++						nanohub_irq2,
++						IRQF_TRIGGER_FALLING |
++						IRQF_ONESHOT | IRQF_NO_AUTOEN,
++						"nanohub-irq2", data);
++		/* optional: fall back to masking it on the hub */
++		if (ret < 0)
++			data->irq2 = 0;
++	}
++
++	return 0;
++}
++
++static int nanohub_request_gpios(struct nanohub_data *data)
++{
++	struct device *dev = data->dev;
++
++	/* hub running, no wakeup request, boot from flash (never the STM32
++	 * ROM bootloader: no firmware updates in this driver)
++	 */
++	data->nreset_gpio = devm_gpiod_get(dev, "nreset", GPIOD_OUT_HIGH);
++	if (IS_ERR(data->nreset_gpio))
++		return dev_err_probe(dev, PTR_ERR(data->nreset_gpio), "nreset\n");
++	data->wakeup_gpio = devm_gpiod_get(dev, "wakeup", GPIOD_OUT_HIGH);
++	if (IS_ERR(data->wakeup_gpio))
++		return dev_err_probe(dev, PTR_ERR(data->wakeup_gpio), "wakeup\n");
++	data->boot0_gpio = devm_gpiod_get(dev, "boot0", GPIOD_OUT_LOW);
++	if (IS_ERR(data->boot0_gpio))
++		return dev_err_probe(dev, PTR_ERR(data->boot0_gpio), "boot0\n");
++
++	data->irq1_gpio = devm_gpiod_get(dev, "irq1", GPIOD_IN);
++	if (IS_ERR(data->irq1_gpio))
++		return dev_err_probe(dev, PTR_ERR(data->irq1_gpio), "irq1\n");
++	data->irq1 = gpiod_to_irq(data->irq1_gpio);
++	if (data->irq1 < 0)
++		return dev_err_probe(dev, data->irq1, "irq1 irq\n");
++
++	data->irq2_gpio = devm_gpiod_get_optional(dev, "irq2", GPIOD_IN);
++	if (IS_ERR(data->irq2_gpio))
++		return dev_err_probe(dev, PTR_ERR(data->irq2_gpio), "irq2\n");
++	data->irq2 = data->irq2_gpio ? gpiod_to_irq(data->irq2_gpio) : 0;
++	if (data->irq2 < 0)
++		data->irq2 = 0;
++
++	return 0;
++}
++
++int nanohub_probe(struct device *dev, struct nanohub_data *data)
++{
++	int ret, i;
++	struct nanohub_buf *buf;
++
++	data->dev = dev;
++	init_waitqueue_head(&data->kthread_wait);
++	nanohub_io_init(&data->free_pool, data, dev);
++
++	buf = vmalloc(sizeof(*buf) * READ_QUEUE_DEPTH);
++	if (!buf)
++		return -ENOMEM;
++	data->vbuf = buf;
++	for (i = 0; i < READ_QUEUE_DEPTH; i++)
++		nanohub_io_put_buf(&data->free_pool, &buf[i]);
++	atomic_set(&data->kthread_run, 0);
++
++	data->ws_read = wakeup_source_register(dev, "nanohub_wakelock_read");
++	if (!data->ws_read) {
++		ret = -ENOMEM;
++		goto fail_ws;
++	}
++
++	atomic_set(&data->lock_mode, LOCK_MODE_NONE);
++	atomic_set(&data->wakeup_cnt, 0);
++	atomic_set(&data->wakeup_lock_cnt, 0);
++	atomic_set(&data->wakeup_acquired, 0);
++	init_waitqueue_head(&data->wakeup_wait);
++
++	ret = nanohub_request_gpios(data);
++	if (ret)
++		goto fail_gpio;
++
++	ret = nanohub_request_irqs(data);
++	if (ret)
++		goto fail_gpio;
++
++	ret = nanohub_create_devices(data);
++	if (ret)
++		goto fail_gpio;
++
++	data->thread = kthread_run(nanohub_kthread, data, "nanohub");
++	if (IS_ERR(data->thread)) {
++		ret = PTR_ERR(data->thread);
++		goto fail_thread;
++	}
++
++	return 0;
++
++fail_thread:
++	nanohub_destroy_devices(data);
++fail_gpio:
++	wakeup_source_unregister(data->ws_read);
++fail_ws:
++	vfree(buf);
++	return ret;
++}
++
++void nanohub_remove(struct nanohub_data *data)
++{
++	nanohub_notify_thread(data);
++	kthread_stop(data->thread);
++	disable_irq(data->irq1);
++	if (data->irq2)
++		disable_irq(data->irq2);
++
++	nanohub_destroy_devices(data);
++	gpiod_set_value(data->wakeup_gpio, 1);
++	wakeup_source_unregister(data->ws_read);
++	vfree(data->vbuf);
++}
++
++static int __init nanohub_init(void)
++{
++	int ret;
++
++	ret = class_register(&nanohub_class);
++	if (ret)
++		return ret;
++
++	major = __register_chrdev(0, 0, ID_NANOHUB_MAX, "nanohub",
++				  &nanohub_fileops);
++	if (major < 0) {
++		ret = major;
++		goto fail_chrdev;
++	}
++
++	ret = spi_register_driver(&nanohub_spi_driver);
++	if (ret)
++		goto fail_spi;
++
++	return 0;
++
++fail_spi:
++	__unregister_chrdev(major, 0, ID_NANOHUB_MAX, "nanohub");
++fail_chrdev:
++	class_unregister(&nanohub_class);
++	return ret;
++}
++
++static void __exit nanohub_cleanup(void)
++{
++	spi_unregister_driver(&nanohub_spi_driver);
++	__unregister_chrdev(major, 0, ID_NANOHUB_MAX, "nanohub");
++	class_unregister(&nanohub_class);
++}
++
++module_init(nanohub_init);
++module_exit(nanohub_cleanup);
++
++MODULE_AUTHOR("Ben Fennema");
++MODULE_DESCRIPTION("Nanohub sensor hub (Nexus 5X), data path only");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/staging/nanohub/main.h b/drivers/staging/nanohub/main.h
+new file mode 100644
+index 000000000..6f712d3ed
+--- /dev/null
++++ b/drivers/staging/nanohub/main.h
+@@ -0,0 +1,141 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2016 Google, Inc.
++ *
++ * Nanohub: the Nexus 5X's sensor hub (an STM32F411 running Google's
++ * CHRE/nanohub firmware, on SPI). Ported from the bullhead 3.10 kernel
++ * (drivers/staging/nanohub) to mainline 6.12 for nexus5x-android17:
++ *   - only the sensor data path: /dev/nanohub and /dev/nanohub_comms, as the
++ *     stock sensors HAL (device/google/contexthub/sensorhal) expects them
++ *   - the firmware update paths (STM32 bootloader, download_*, erase_shared)
++ *     are left out on purpose: nothing here can rewrite the hub's flash
++ *   - gpiod, wakeup_source and a plain struct instead of gpio numbers,
++ *     Android wakelocks and an empty IIO device
++ */
++
++#ifndef _NANOHUB_MAIN_H
++#define _NANOHUB_MAIN_H
++
++#include <linux/kernel.h>
++#include <linux/gpio/consumer.h>
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <linux/wait.h>
++#include <linux/device.h>
++
++#include "comms.h"
++
++#define NANOHUB_NAME "nanohub"
++
++struct nanohub_buf {
++	struct list_head list;
++	uint8_t buffer[255];
++	uint8_t length;
++};
++
++struct nanohub_data;
++
++struct nanohub_io {
++	struct device *dev;
++	struct nanohub_data *data;
++	wait_queue_head_t buf_wait;
++	struct list_head buf_list;
++};
++
++static inline struct nanohub_data *dev_get_nanohub_data(struct device *dev)
++{
++	struct nanohub_io *io = dev_get_drvdata(dev);
++
++	return io->data;
++}
++
++struct nanohub_data {
++	/* indices for io[] array */
++	#define ID_NANOHUB_SENSOR 0
++	#define ID_NANOHUB_COMMS 1
++	#define ID_NANOHUB_MAX 2
++
++	struct device *dev;		/* the SPI device */
++	struct nanohub_io io[ID_NANOHUB_MAX];
++
++	struct nanohub_comms comms;
++
++	struct gpio_desc *nreset_gpio;
++	struct gpio_desc *wakeup_gpio;
++	struct gpio_desc *boot0_gpio;
++	struct gpio_desc *irq1_gpio;
++	struct gpio_desc *irq2_gpio;	/* optional; none on bullhead */
++	int irq1;
++	int irq2;
++
++	atomic_t kthread_run;
++	atomic_t thread_state;
++	wait_queue_head_t kthread_wait;
++
++	struct wakeup_source *ws_read;
++
++	struct nanohub_io free_pool;
++
++	atomic_t lock_mode;
++	/* these 3 vars should be accessed only with wakeup_wait.lock held */
++	atomic_t wakeup_cnt;
++	atomic_t wakeup_lock_cnt;
++	atomic_t wakeup_acquired;
++	wait_queue_head_t wakeup_wait;
++
++	uint32_t interrupts[8];
++
++	int err_cnt;
++	void *vbuf;
++	struct task_struct *thread;
++};
++
++enum {
++	KEY_WAKEUP_NONE,
++	KEY_WAKEUP,
++	KEY_WAKEUP_LOCK,
++};
++
++enum {
++	LOCK_MODE_NONE,
++	LOCK_MODE_NORMAL,
++	LOCK_MODE_IO,
++	LOCK_MODE_RESET,
++	LOCK_MODE_SUSPEND_RESUME,
++};
++
++int request_wakeup_ex(struct nanohub_data *data, long timeout,
++		      int key, int lock_mode);
++void release_wakeup_ex(struct nanohub_data *data, int key, int lock_mode);
++int nanohub_wait_for_interrupt(struct nanohub_data *data);
++int nanohub_wakeup_eom(struct nanohub_data *data, bool repeat);
++int nanohub_probe(struct device *dev, struct nanohub_data *data);
++void nanohub_remove(struct nanohub_data *data);
++
++static inline int nanohub_irq1_fired(struct nanohub_data *data)
++{
++	return !gpiod_get_value(data->irq1_gpio);
++}
++
++static inline int nanohub_irq2_fired(struct nanohub_data *data)
++{
++	return data->irq2 && !gpiod_get_value(data->irq2_gpio);
++}
++
++static inline int request_wakeup_timeout(struct nanohub_data *data, int timeout)
++{
++	return request_wakeup_ex(data, timeout, KEY_WAKEUP, LOCK_MODE_NORMAL);
++}
++
++static inline int request_wakeup(struct nanohub_data *data)
++{
++	return request_wakeup_ex(data, MAX_SCHEDULE_TIMEOUT, KEY_WAKEUP,
++				 LOCK_MODE_NORMAL);
++}
++
++static inline void release_wakeup(struct nanohub_data *data)
++{
++	release_wakeup_ex(data, KEY_WAKEUP, LOCK_MODE_NORMAL);
++}
++
++#endif
+diff --git a/drivers/staging/nanohub/spi.c b/drivers/staging/nanohub/spi.c
+new file mode 100644
+index 000000000..93e258788
+--- /dev/null
++++ b/drivers/staging/nanohub/spi.c
+@@ -0,0 +1,289 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2016 Google, Inc.
++ *
++ * Nanohub over SPI. The driver drives the chip select itself (a GPIO, held
++ * for a whole request/reply exchange under spi_bus_lock()), as the stock
++ * one did; the controller's own CS pin is left as a plain GPIO.
++ */
++
++#include <linux/delay.h>
++#include <linux/spi/spi.h>
++#include <linux/gpio/consumer.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/semaphore.h>
++#include <linux/slab.h>
++
++#include "main.h"
++#include "comms.h"
++
++#define SPI_MIN_DMA		48
++/* an exact rate of the QUP clock (960k, 4.8M, 9.6M, 15M, ...): it rounds
++ * up, and 10 MHz became 15 MHz, too fast for the hub. Stock ran ~9.6 MHz.
++ */
++#define SPI_SPEED_HZ		9600000
++
++struct nanohub_spi_data {
++	struct nanohub_data data;
++	struct spi_device *device;
++	struct semaphore spi_sem;
++	struct gpio_desc *cs;
++	uint16_t rx_length;
++	uint16_t rx_offset;
++};
++
++static int nanohub_spi_write(void *data, uint8_t *tx, int length, int timeout)
++{
++	struct nanohub_spi_data *spi_data = data;
++	const struct nanohub_comms *comms = &spi_data->data.comms;
++	int max_len = sizeof(struct nanohub_packet) + MAX_UINT8 +
++		      sizeof(struct nanohub_packet_crc);
++	struct spi_message msg;
++	struct spi_transfer xfer = {
++		.len = max_len + timeout,
++		.tx_buf = comms->tx_buffer,
++		.rx_buf = comms->rx_buffer,
++		.cs_change = 1,
++	};
++
++	spi_data->rx_offset = max_len;
++	spi_data->rx_length = max_len + timeout;
++	memcpy(comms->tx_buffer, tx, length);
++	memset(comms->tx_buffer + length, 0xFF, max_len + timeout - length);
++
++	spi_message_init_with_transfers(&msg, &xfer, 1);
++
++	if (spi_sync_locked(spi_data->device, &msg) == 0)
++		return length;
++	else
++		return ERROR_NACK;
++}
++
++static int nanohub_spi_read(void *data, uint8_t *rx, int max_length,
++			    int timeout)
++{
++	struct nanohub_spi_data *spi_data = data;
++	struct nanohub_comms *comms = &spi_data->data.comms;
++	const int min_size = sizeof(struct nanohub_packet) +
++			     sizeof(struct nanohub_packet_crc);
++	int i, ret;
++	int offset = 0;
++	struct nanohub_packet *packet = NULL;
++	struct spi_message msg;
++	struct spi_transfer xfer = {
++		.len = timeout,
++		.tx_buf = comms->tx_buffer,
++		.rx_buf = comms->rx_buffer,
++		.cs_change = 1,
++	};
++
++	if (max_length < min_size)
++		return ERROR_NACK;
++
++	/* consume leftover bytes, if any */
++	if (spi_data->rx_offset < spi_data->rx_length) {
++		for (i = spi_data->rx_offset; i < spi_data->rx_length; i++) {
++			if (comms->rx_buffer[i] != 0xFF) {
++				offset = spi_data->rx_length - i;
++
++				if (offset <
++				    offsetof(struct nanohub_packet,
++					     len) + sizeof(packet->len)) {
++					memcpy(rx, &comms->rx_buffer[i],
++					       offset);
++					xfer.len =
++					    min_size + MAX_UINT8 - offset;
++					break;
++				} else {
++					packet =
++					    (struct nanohub_packet *)&comms->
++					    rx_buffer[i];
++					if (offset < min_size + packet->len) {
++						memcpy(rx, packet, offset);
++						xfer.len =
++						    min_size + packet->len -
++						    offset;
++						break;
++					} else {
++						memcpy(rx, packet,
++						       min_size + packet->len);
++						spi_data->rx_offset = i +
++						     min_size + packet->len;
++						return min_size + packet->len;
++					}
++				}
++			}
++		}
++	}
++
++	if (xfer.len != 1 && xfer.len < SPI_MIN_DMA)
++		xfer.len = SPI_MIN_DMA;
++	memset(comms->tx_buffer, 0xFF, xfer.len);
++
++	spi_message_init_with_transfers(&msg, &xfer, 1);
++
++	ret = spi_sync_locked(spi_data->device, &msg);
++	if (ret == 0) {
++		if (offset > 0) {
++			packet = (struct nanohub_packet *)rx;
++			if (offset + xfer.len > max_length)
++				memcpy(&rx[offset], comms->rx_buffer,
++					max_length - offset);
++			else
++				memcpy(&rx[offset], comms->rx_buffer, xfer.len);
++			spi_data->rx_offset = spi_data->rx_length = 0;
++		} else {
++			for (i = 0; i < xfer.len; i++) {
++				if (comms->rx_buffer[i] != 0xFF) {
++					spi_data->rx_length = xfer.len;
++
++					if (xfer.len - i < min_size) {
++						spi_data->rx_offset = i;
++						break;
++					} else {
++						packet =
++						    (struct nanohub_packet *)
++						    &comms->rx_buffer[i];
++						if (xfer.len - i <
++						    min_size + packet->len) {
++							packet = NULL;
++							spi_data->rx_offset = i;
++						} else {
++							memcpy(rx, packet,
++							       min_size +
++							       packet->len);
++							spi_data->rx_offset =
++							    i + min_size +
++							    packet->len;
++						}
++					}
++					break;
++				}
++			}
++		}
++	}
++
++	if (ret < 0)
++		return ret;
++	else if (!packet)
++		return 0;
++	else
++		return min_size + packet->len;
++}
++
++static int nanohub_spi_open(void *data)
++{
++	struct nanohub_spi_data *spi_data = data;
++
++	down(&spi_data->spi_sem);
++	spi_bus_lock(spi_data->device->controller);
++	udelay(40);
++	gpiod_set_value(spi_data->cs, 0);
++	udelay(30);
++	return 0;
++}
++
++static void nanohub_spi_close(void *data)
++{
++	struct nanohub_spi_data *spi_data = data;
++
++	gpiod_set_value(spi_data->cs, 1);
++	spi_bus_unlock(spi_data->device->controller);
++	up(&spi_data->spi_sem);
++	udelay(60);
++}
++
++static int nanohub_spi_comms_init(struct nanohub_spi_data *spi_data)
++{
++	struct nanohub_comms *comms = &spi_data->data.comms;
++	struct device *dev = &spi_data->device->dev;
++	int max_len = sizeof(struct nanohub_packet) + MAX_UINT8 +
++		      sizeof(struct nanohub_packet_crc);
++
++	comms->seq = 1;
++	comms->timeout_write = 544;
++	comms->timeout_ack = 272;
++	comms->timeout_reply = 512;
++	comms->open = nanohub_spi_open;
++	comms->close = nanohub_spi_close;
++	comms->write = nanohub_spi_write;
++	comms->read = nanohub_spi_read;
++
++	max_len += comms->timeout_write;
++	max_len = max(max_len, comms->timeout_ack);
++	max_len = max(max_len, comms->timeout_reply);
++	comms->tx_buffer = devm_kmalloc(dev, max_len, GFP_KERNEL);
++	comms->rx_buffer = devm_kmalloc(dev, max_len, GFP_KERNEL);
++	if (!comms->tx_buffer || !comms->rx_buffer)
++		return -ENOMEM;
++
++	spi_data->rx_length = 0;
++	spi_data->rx_offset = 0;
++
++	sema_init(&spi_data->spi_sem, 1);
++	return 0;
++}
++
++static int nanohub_spi_probe(struct spi_device *spi)
++{
++	struct device *dev = &spi->dev;
++	struct nanohub_spi_data *spi_data;
++	int ret;
++
++	spi_data = devm_kzalloc(dev, sizeof(*spi_data), GFP_KERNEL);
++	if (!spi_data)
++		return -ENOMEM;
++	spi_data->device = spi;
++
++	/* the hub's chip select, idle high */
++	spi_data->cs = devm_gpiod_get(dev, "hub-cs", GPIOD_OUT_HIGH);
++	if (IS_ERR(spi_data->cs))
++		return dev_err_probe(dev, PTR_ERR(spi_data->cs),
++				     "no hub-cs-gpios\n");
++
++	spi->max_speed_hz = SPI_SPEED_HZ;
++	spi->mode = SPI_MODE_0;
++	spi->bits_per_word = 8;
++	ret = spi_setup(spi);
++	if (ret)
++		return dev_err_probe(dev, ret, "spi_setup\n");
++
++	ret = nanohub_spi_comms_init(spi_data);
++	if (ret)
++		return ret;
++
++	spi_set_drvdata(spi, spi_data);
++
++	return nanohub_probe(dev, &spi_data->data);
++}
++
++static void nanohub_spi_remove(struct spi_device *spi)
++{
++	struct nanohub_spi_data *spi_data = spi_get_drvdata(spi);
++
++	nanohub_remove(&spi_data->data);
++	gpiod_set_value(spi_data->cs, 1);
++}
++
++static const struct of_device_id nanohub_spi_of_match[] = {
++	{ .compatible = "google,nanohub" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, nanohub_spi_of_match);
++
++static const struct spi_device_id nanohub_spi_id[] = {
++	{ NANOHUB_NAME, 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(spi, nanohub_spi_id);
++
++struct spi_driver nanohub_spi_driver = {
++	.driver = {
++		.name = NANOHUB_NAME,
++		.of_match_table = nanohub_spi_of_match,
++	},
++	.probe = nanohub_spi_probe,
++	.remove = nanohub_spi_remove,
++	.id_table = nanohub_spi_id,
++};
+-- 
+2.43.0
+

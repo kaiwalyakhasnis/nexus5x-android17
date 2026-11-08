@@ -1,0 +1,88 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * The Nexus 5X's sensor hub ("nanohub", an STM32F411): every sensor
+ * (BMI160 accel/gyro, BMM150 compass, BMP280 pressure, RPR0521 light and
+ * proximity) is behind it, and it talks to the SoC over BLSP2 QUP1's SPI
+ * (stock: spi_7). Wiring from the stock 3.10 device tree
+ * (msm8992-bullhead-sensorhub.dtsi):
+ *
+ *   SPI     GPIO 41 MOSI, 42 MISO, 44 CLK (blsp_spi7); GIC SPI 101
+ *   CS      GPIO 43, driven by the driver itself (a plain GPIO)
+ *   NRESET  GPIO 59    BOOT0  GPIO 60 (kept low: run the firmware in flash)
+ *   WAKEUP  GPIO 65 (SoC -> hub)    IRQ1  GPIO 66 (hub -> SoC, pulled up)
+ *
+ * Power: stock bullhead keeps L18 (3.0 V), L19 (1.8 V) and LVS2 (1.8 V)
+ * always on with no consumer (msm8992-bullhead-regulator.dtsi): the hub's
+ * and the sensors' rails. Mainline defines L18/L19 (fixed voltages) but
+ * leaves them off, and has no LVS2: without them the hub is dead.
+ *
+ * Driver: drivers/staging/nanohub (patches/0004), data path only.
+ */
+
+&pm8994_l18 {
+	regulator-always-on;
+};
+
+&pm8994_l19 {
+	regulator-always-on;
+};
+
+&pm8994_regulators {
+	pm8994_lvs2: lvs2 {
+		regulator-always-on;
+	};
+};
+
+&soc {
+	blsp2_spi1: spi@f9963000 {
+		compatible = "qcom,spi-qup-v2.2.1";
+		reg = <0xf9963000 0x500>;
+		interrupts = <GIC_SPI 101 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&gcc GCC_BLSP2_QUP1_SPI_APPS_CLK>,
+			 <&gcc GCC_BLSP2_AHB_CLK>;
+		clock-names = "core", "iface";
+		pinctrl-names = "default";
+		pinctrl-0 = <&sensorhub_spi_default>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		sensorhub@0 {
+			compatible = "google,nanohub";
+			reg = <0>;
+			spi-max-frequency = <9600000>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&sensorhub_gpio_default>, <&sensorhub_irq_default>;
+			hub-cs-gpios = <&tlmm 43 GPIO_ACTIVE_HIGH>;
+			nreset-gpios = <&tlmm 59 GPIO_ACTIVE_HIGH>;
+			boot0-gpios = <&tlmm 60 GPIO_ACTIVE_HIGH>;
+			wakeup-gpios = <&tlmm 65 GPIO_ACTIVE_HIGH>;
+			irq1-gpios = <&tlmm 66 GPIO_ACTIVE_HIGH>;
+		};
+	};
+};
+
+&tlmm {
+	sensorhub_spi_default: sensorhub-spi-default-state {
+		pins = "gpio41", "gpio42", "gpio44";
+		function = "blsp_spi7";
+		drive-strength = <12>;
+		bias-disable;
+	};
+
+	sensorhub_gpio_default: sensorhub-gpio-default-state {
+		pins = "gpio43", "gpio59", "gpio60", "gpio65";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	/* the hub only pulls IRQ1 low: without this pull-up it reads low all
+	 * the time, and every request goes out before the hub is awake
+	 */
+	sensorhub_irq_default: sensorhub-irq-default-state {
+		pins = "gpio66";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+};
