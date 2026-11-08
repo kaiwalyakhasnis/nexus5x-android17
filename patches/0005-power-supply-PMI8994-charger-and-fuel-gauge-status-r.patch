@@ -1,0 +1,378 @@
+From 607f39c74f8b1517ff36ccce97556206cf461758 Mon Sep 17 00:00:00 2001
+From: kk <kaiwalyakhasnis57@gmail.com>
+Date: Sun, 8 Nov 2026 20:01:45 +0900
+Subject: [PATCH] power: supply: PMI8994 charger and fuel gauge status,
+ read-only
+
+Mainline has no driver for the PMI8994's charger (SMBCHG) or fuel gauge
+(FG). On the Nexus 5X the charger charges on its hardware defaults
+anyway, and the fuel gauge keeps tracking the state of charge with the
+battery profile the stock kernel loaded into its SRAM. This reports
+their status registers, the ones the 3.10 qpnp-smbcharger and qpnp-fg
+drivers read, as "battery" (status, charge type, health from the JEITA
+zones, present, capacity) and "usb" (online) power supplies, polled
+every 5 s. It never writes to the PMIC.
+---
+ drivers/power/supply/Kconfig                  |  10 +
+ drivers/power/supply/Makefile                 |   1 +
+ drivers/power/supply/pmi8994_charger_status.c | 318 ++++++++++++++++++
+ 3 files changed, 329 insertions(+)
+ create mode 100644 drivers/power/supply/pmi8994_charger_status.c
+
+diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
+index bcfa63fb9..b0ea413b9 100644
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -636,6 +636,16 @@ config CHARGER_MT6370
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called "mt6370-charger".
+ 
++config CHARGER_PMI8994_STATUS
++	tristate "PMI8994 charger and fuel gauge status (read-only)"
++	depends on MFD_SPMI_PMIC || COMPILE_TEST
++	depends on OF
++	help
++	  Reports the Qualcomm PMI8994's charger and fuel gauge status (state
++	  of charge, charging state, battery temperature zone, USB power) as
++	  power supplies, without configuring or controlling the charger: the
++	  hardware charges on its own. For the Nexus 5X.
++
+ config CHARGER_QCOM_SMBB
+ 	tristate "Qualcomm Switch-Mode Battery Charger and Boost"
+ 	depends on MFD_SPMI_PMIC || COMPILE_TEST
+diff --git a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
+index 8dcb41545..4b70a3c41 100644
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -117,3 +117,4 @@ obj-$(CONFIG_CHARGER_SURFACE)	+= surface_charger.o
+ obj-$(CONFIG_BATTERY_UG3105)	+= ug3105_battery.o
+ obj-$(CONFIG_CHARGER_QCOM_SMB2)	+= qcom_pmi8998_charger.o
+ obj-$(CONFIG_FUEL_GAUGE_MM8013)	+= mm8013.o
++obj-$(CONFIG_CHARGER_PMI8994_STATUS)	+= pmi8994_charger_status.o
+diff --git a/drivers/power/supply/pmi8994_charger_status.c b/drivers/power/supply/pmi8994_charger_status.c
+new file mode 100644
+index 000000000..f90bba191
+--- /dev/null
++++ b/drivers/power/supply/pmi8994_charger_status.c
+@@ -0,0 +1,318 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * PMI8994 charger and fuel gauge status, read-only.
++ *
++ * The PMI8994's charger (SMBCHG) charges the battery on its own, from the
++ * defaults it powers up with and what the bootloader set; its fuel gauge
++ * (FG) keeps tracking the state of charge in the PMIC, with the battery
++ * profile the last stock boot loaded into its SRAM. Mainline has no driver
++ * for either. This one only reads their status registers (the ones the
++ * Nexus 5X's 3.10 qpnp-smbcharger and qpnp-fg drivers read) and reports
++ * them as the "battery" and "usb" power supplies, for Android's health HAL.
++ * It never writes the PMIC: charging stays as the hardware does it.
++ *
++ * DT: a node in the PMI8994's SPMI device, reg = <charger base>, <FG SOC
++ * base>: 0x1000 (CHGR; BAT_IF at +0x200, USB_CHGPTH at +0x300) and 0x4000.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/devm-helpers.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/power_supply.h>
++#include <linux/regmap.h>
++#include <linux/of.h>
++#include <linux/workqueue.h>
++
++/* SMBCHG peripherals, from the charger base (qcom,chgr@1000) */
++#define BAT_IF			0x200
++#define USB_CHGPTH		0x300
++#define RT_STS			0x10
++
++/* CHGR */
++#define CHGR_STS		0x0e
++#define  CHG_HOLD_OFF		BIT(3)
++#define  CHG_TYPE		GENMASK(2, 1)
++#define   CHG_TYPE_NONE		0
++#define   CHG_TYPE_PRE		1
++#define   CHG_TYPE_FAST		2
++#define   CHG_TYPE_TAPER	3
++/* CHGR RT_STS */
++#define  CHG_INHIBIT		BIT(1)
++#define  BAT_TCC_REACHED	BIT(7)	/* charge complete */
++
++/* BAT_IF */
++#define BAT_PRES_STATUS		0x08
++#define  BAT_PRES		BIT(7)
++/* BAT_IF RT_STS: JEITA temperature zones */
++#define  HOT_BAT_HARD		BIT(0)
++#define  HOT_BAT_SOFT		BIT(1)
++#define  COLD_BAT_HARD		BIT(2)
++#define  COLD_BAT_SOFT		BIT(3)
++#define  BAT_MISSING		BIT(6)
++
++/* USB_CHGPTH RT_STS */
++#define  USBIN_UV		BIT(0)
++#define  USBIN_OV		BIT(1)
++#define  USBIN_SRC_DET		BIT(2)
++
++/* FG SOC (qcom,fg-soc@4000): the monotonic state of charge, 0..0xff, and
++ * a shadow copy to check the two bytes were not caught mid-update
++ */
++#define SOC_MONOTONIC_SOC	0x09
++
++#define POLL_MS			5000
++
++struct pmi8994_status {
++	struct device *dev;
++	struct regmap *regmap;
++	u32 chgr, fg_soc;
++	struct power_supply *battery, *usb;
++	struct delayed_work poll;
++	int last[4];		/* online, status, capacity, health */
++};
++
++static int rd(struct pmi8994_status *s, u32 addr, u8 *val)
++{
++	unsigned int v;
++	int ret = regmap_read(s->regmap, addr, &v);
++
++	*val = v;
++	return ret;
++}
++
++static bool usb_online(struct pmi8994_status *s)
++{
++	u8 sts;
++
++	if (rd(s, s->chgr + USB_CHGPTH + RT_STS, &sts))
++		return false;
++	return (sts & USBIN_SRC_DET) && !(sts & (USBIN_UV | USBIN_OV));
++}
++
++/* qpnp-smbcharger get_prop_batt_status() */
++static int batt_status(struct pmi8994_status *s)
++{
++	u8 rt, sts;
++
++	if (!usb_online(s))
++		return POWER_SUPPLY_STATUS_DISCHARGING;
++	if (rd(s, s->chgr + RT_STS, &rt) || rd(s, s->chgr + CHGR_STS, &sts))
++		return POWER_SUPPLY_STATUS_UNKNOWN;
++	if (rt & (BAT_TCC_REACHED | CHG_INHIBIT))
++		return POWER_SUPPLY_STATUS_FULL;
++	if (sts & CHG_HOLD_OFF)
++		return POWER_SUPPLY_STATUS_NOT_CHARGING;
++	if (FIELD_GET(CHG_TYPE, sts) == CHG_TYPE_NONE)
++		return POWER_SUPPLY_STATUS_NOT_CHARGING;
++	return POWER_SUPPLY_STATUS_CHARGING;
++}
++
++static int charge_type(struct pmi8994_status *s)
++{
++	u8 sts;
++
++	if (!usb_online(s) || rd(s, s->chgr + CHGR_STS, &sts))
++		return POWER_SUPPLY_CHARGE_TYPE_NONE;
++	switch (FIELD_GET(CHG_TYPE, sts)) {
++	case CHG_TYPE_PRE:
++		return POWER_SUPPLY_CHARGE_TYPE_TRICKLE;
++	case CHG_TYPE_FAST:
++		return POWER_SUPPLY_CHARGE_TYPE_FAST;
++	case CHG_TYPE_TAPER:
++		return POWER_SUPPLY_CHARGE_TYPE_STANDARD;	/* taper: constant voltage */
++	default:
++		return POWER_SUPPLY_CHARGE_TYPE_NONE;
++	}
++}
++
++static int batt_health(struct pmi8994_status *s)
++{
++	u8 rt;
++
++	if (rd(s, s->chgr + BAT_IF + RT_STS, &rt))
++		return POWER_SUPPLY_HEALTH_UNKNOWN;
++	if (rt & HOT_BAT_HARD)
++		return POWER_SUPPLY_HEALTH_OVERHEAT;
++	if (rt & COLD_BAT_HARD)
++		return POWER_SUPPLY_HEALTH_COLD;
++	if (rt & HOT_BAT_SOFT)
++		return POWER_SUPPLY_HEALTH_WARM;	/* charging, gentler */
++	if (rt & COLD_BAT_SOFT)
++		return POWER_SUPPLY_HEALTH_COOL;
++	return POWER_SUPPLY_HEALTH_GOOD;
++}
++
++static bool batt_present(struct pmi8994_status *s)
++{
++	u8 pres, rt;
++
++	if (rd(s, s->chgr + BAT_IF + BAT_PRES_STATUS, &pres) ||
++	    rd(s, s->chgr + BAT_IF + RT_STS, &rt))
++		return false;
++	return (pres & BAT_PRES) && !(rt & BAT_MISSING);
++}
++
++/* qpnp-fg get_prop_capacity(): monotonic SOC * 100 / 0xff */
++static int capacity(struct pmi8994_status *s)
++{
++	u8 soc, shadow;
++	int tries;
++
++	for (tries = 0; tries < 5; tries++) {
++		if (rd(s, s->fg_soc + SOC_MONOTONIC_SOC, &soc) ||
++		    rd(s, s->fg_soc + SOC_MONOTONIC_SOC + 1, &shadow))
++			return -EIO;
++		if (soc == shadow)
++			return DIV_ROUND_UP(soc * 100, 0xff);
++	}
++	return -EAGAIN;
++}
++
++static const enum power_supply_property battery_props[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_CHARGE_TYPE,
++	POWER_SUPPLY_PROP_HEALTH,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_TECHNOLOGY,
++};
++
++static int battery_get(struct power_supply *psy, enum power_supply_property psp,
++		       union power_supply_propval *val)
++{
++	struct pmi8994_status *s = power_supply_get_drvdata(psy);
++	int ret;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_STATUS:
++		val->intval = batt_status(s);
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_TYPE:
++		val->intval = charge_type(s);
++		break;
++	case POWER_SUPPLY_PROP_HEALTH:
++		val->intval = batt_health(s);
++		break;
++	case POWER_SUPPLY_PROP_PRESENT:
++		val->intval = batt_present(s);
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		ret = capacity(s);
++		if (ret < 0)
++			return ret;
++		val->intval = ret;
++		break;
++	case POWER_SUPPLY_PROP_TECHNOLOGY:
++		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
++		break;
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static const enum power_supply_property usb_props[] = {
++	POWER_SUPPLY_PROP_ONLINE,
++};
++
++static int usb_get(struct power_supply *psy, enum power_supply_property psp,
++		   union power_supply_propval *val)
++{
++	struct pmi8994_status *s = power_supply_get_drvdata(psy);
++
++	if (psp != POWER_SUPPLY_PROP_ONLINE)
++		return -EINVAL;
++	val->intval = usb_online(s);
++	return 0;
++}
++
++static const struct power_supply_desc battery_desc = {
++	.name = "battery",
++	.type = POWER_SUPPLY_TYPE_BATTERY,
++	.properties = battery_props,
++	.num_properties = ARRAY_SIZE(battery_props),
++	.get_property = battery_get,
++};
++
++static const struct power_supply_desc usb_desc = {
++	.name = "usb",
++	.type = POWER_SUPPLY_TYPE_USB,
++	.properties = usb_props,
++	.num_properties = ARRAY_SIZE(usb_props),
++	.get_property = usb_get,
++};
++
++/* No interrupts are taken (they belong to the charger driver mainline
++ * doesn't have yet): poll, and tell user space when something changed.
++ */
++static void poll_work(struct work_struct *work)
++{
++	struct pmi8994_status *s = container_of(work, struct pmi8994_status, poll.work);
++	int now[4] = { usb_online(s), batt_status(s), capacity(s), batt_health(s) };
++
++	if (memcmp(now, s->last, sizeof(now))) {
++		memcpy(s->last, now, sizeof(now));
++		power_supply_changed(s->battery);
++		power_supply_changed(s->usb);
++	}
++	schedule_delayed_work(&s->poll, msecs_to_jiffies(POLL_MS));
++}
++
++static int pmi8994_status_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct power_supply_config cfg = {};
++	struct pmi8994_status *s;
++	u32 reg[2];
++	int ret;
++
++	s = devm_kzalloc(dev, sizeof(*s), GFP_KERNEL);
++	if (!s)
++		return -ENOMEM;
++	s->dev = dev;
++	s->regmap = dev_get_regmap(dev->parent, NULL);
++	if (!s->regmap)
++		return dev_err_probe(dev, -ENODEV, "no PMIC regmap\n");
++	ret = of_property_read_u32_array(dev->of_node, "reg", reg, 2);
++	if (ret)
++		return dev_err_probe(dev, ret, "reg: charger and FG SOC bases\n");
++	s->chgr = reg[0];
++	s->fg_soc = reg[1];
++
++	cfg.drv_data = s;
++	cfg.of_node = dev->of_node;
++	s->battery = devm_power_supply_register(dev, &battery_desc, &cfg);
++	if (IS_ERR(s->battery))
++		return dev_err_probe(dev, PTR_ERR(s->battery), "battery\n");
++	s->usb = devm_power_supply_register(dev, &usb_desc, &cfg);
++	if (IS_ERR(s->usb))
++		return dev_err_probe(dev, PTR_ERR(s->usb), "usb\n");
++
++	ret = devm_delayed_work_autocancel(dev, &s->poll, poll_work);
++	if (ret)
++		return ret;
++	schedule_delayed_work(&s->poll, 0);
++
++	dev_info(dev, "battery %d%%, %s\n", capacity(s),
++		 usb_online(s) ? "USB power" : "on battery");
++	return 0;
++}
++
++static const struct of_device_id pmi8994_status_of_match[] = {
++	{ .compatible = "qcom,pmi8994-charger-status" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, pmi8994_status_of_match);
++
++static struct platform_driver pmi8994_status_driver = {
++	.probe = pmi8994_status_probe,
++	.driver = {
++		.name = "pmi8994-charger-status",
++		.of_match_table = pmi8994_status_of_match,
++	},
++};
++module_platform_driver(pmi8994_status_driver);
++
++MODULE_DESCRIPTION("PMI8994 charger and fuel gauge status (read-only)");
++MODULE_LICENSE("GPL");
+-- 
+2.43.0
+

@@ -16,6 +16,11 @@ and the **Adreno 418 GPU** draws it with **Mesa freedreno**, built here with
 the Android NDK. No AOSP tree and no framework build: the PC this was made on
 is far too slow for that.
 
+Beyond display and touch, **Wi-Fi**, **all 16 sensors**, **brightness and
+auto-brightness**, the **notification LED** and the **battery level** work
+through Android's normal APIs, with HALs built from the SDK and NDK alone.
+[docs/](docs/) has one page per service: how it was brought up and tested.
+
 | Lock screen | Home screen (round icons, 3-button nav) | Settings → About phone |
 |:---:|:---:|:---:|
 | <img src="media/lockscreen.png" width="260"> | <img src="media/home-round-icons.png" width="260"> | <img src="media/about-android17.png" width="260"> |
@@ -39,12 +44,16 @@ smoother. [Gallery as a bubble](media/bubble-gallery.gif).*
 | ✅ | Touchscreen | mainline `rmi4` |
 | ✅ | adb (over the USB network), rescue root shell | `adb connect 172.16.42.1:5555`, `telnet 172.16.42.1` |
 | ✅ | Sensors: accelerometer, gyroscope, compass, barometer, light, proximity, steps, rotation vectors, gravity (16) | the nanohub on SPI: ported kernel driver + our NDK-built AIDL HAL; see [docs/sensors.md](docs/sensors.md) |
-| ✅ | KeyMint, Gatekeeper, health, power, thermal, lights (software HALs) | from Google's Android 17 emulator vendor image |
+| ✅ | Brightness slider, auto-brightness, notification LED | PMI8994 WLED + LPG (mainline drivers) and our NDK-built lights HAL; see [docs/lights.md](docs/lights.md) |
+| ✅ | Wi-Fi: scan, connect, internet (2.4 and 5 GHz) | mainline `ath10k` (the base project's PCIe), the emulator's generic Wi-Fi HAL and `wpa_supplicant`; see [docs/wifi.md](docs/wifi.md) |
+| ✅ | Battery level and charging state in the status bar | a read-only PMI8994 charger/fuel-gauge status driver; see [docs/battery.md](docs/battery.md) |
+| ⚠️ | Charging speed | the PMIC charges on its own defaults: USB 500 mA mode, so slowly, and it pauses when the battery gets hot. No battery voltage or temperature in Android yet |
+| ✅ | KeyMint, Gatekeeper, health, power, thermal (software HALs) | from Google's Android 17 emulator vendor image |
 | ✅ | zram swap | half the RAM, compressed |
 | ✅ | Boots by itself | `boot`, `system`, `vendor`, `userdata` all flashed on the eMMC; no PC needed |
 | ⚠️ | Boot reliability | ~1 boot in 6 the RPM doesn't answer (base project's known issue), worse after button resets; the ramdisk detects it and restarts after 30 s (or `boot.main.kts` retries from the PC) |
 | ❌ | Suspend | blocked with a wakelock: the phone never wakes from s2idle |
-| ❌ | Wi-Fi, Bluetooth, modem, audio, camera, GNSS, battery level, RTC, notification LED | no HAL yet (emulator ones removed) |
+| ❌ | Bluetooth, modem, audio, camera, GNSS, RTC, vibrator | no driver or HAL yet (emulator ones removed) |
 | ❌ | Hardware video codecs | software codecs only |
 
 ## How it fits together
@@ -154,6 +163,10 @@ the HWC shim (C) and the HALs in `hal/` (C++, they live in Android) aren't.
 #   downloads/gsi/aosp_arm64-exp-CP3A.260905.010-*.zip   -> extracted/system.img
 #   downloads/emu/arm64-v8a-37.0_r06.zip (SDK repo)     -> extracted/arm64-v8a/
 #   downloads/mesa/mesa-26.0.3.tar.xz, tools/android-ndk-r28c (NDK)
+#   downloads/linux-firmware/: a420_pm4.fw a420_pfp.fw LICENSE.qcom (GPU),
+#     firmware-6.bin notice_ath10k_firmware-6.txt regulatory.db{,.p7s} (Wi-Fi)
+#   backup/vendor-mmcblk1p39.img: the stock vendor partition (Wi-Fi calibration;
+#     or STOCK_VENDOR=)
 python3 -m venv tools/venv && tools/venv/bin/pip install meson ninja mako packaging pyyaml
 
 # Kotlin 2.2.21: the compiler (for the scripts) in tools/kotlinc, and
@@ -166,7 +179,7 @@ export PATH=$PWD/tools/kotlinc/bin:$PATH JAVA_HOME=/usr/lib/jvm/java-21-openjdk-
 scripts/build-kernel.main.kts    # kernel + modules (out/kernel, out/modules)
 scripts/build-mesa.main.kts      # out/mesa/lib64/egl/*_mesa.so
 scripts/build-overlays.main.kts  # out/overlay/*.apk
-scripts/build-hal.main.kts       # out/hal/: the sensors HAL (SDK aidl + NDK; fetches ~7 MB of AOSP)
+scripts/build-hal.main.kts       # out/hal/: sensors + lights HALs (SDK aidl + NDK; fetches ~7 MB of AOSP)
 VENDOR_SIZE=248M scripts/make-vendor.main.kts   # out/vendor.img, the partition's size
 scripts/build-bootimg.main.kts   # out/boot-android-rev-{10,101}.img (+ tools/phone)
 
@@ -180,12 +193,13 @@ fastboot flash userdata out/userdata.simg   # an empty ext4, 11771295744 bytes
 scripts/boot.main.kts            # or, without flashing boot: fastboot boot, with retries
 adb connect 172.16.42.1:5555     # scripts/tsh.main.kts 'cmd' (or telnet 172.16.42.1) for a root shell
 
-scripts/build-apps.main.kts      # test apps: out/apps/SensorTest.apk (SDK only, no Gradle)
+scripts/build-apps.main.kts      # test apps: out/apps/{SensorTest,LightsTest}.apk (SDK only, no Gradle)
 adb install -r out/apps/SensorTest.apk
 ```
 
 The boot and vendor images go together: the vendor image's sensors HAL
-expects the kernel's hub driver (`/dev/nanohub`).
+expects the kernel's hub driver (`/dev/nanohub`), and its Wi-Fi script loads
+`ath10k` from the kernel's module directory.
 
 `android.disks=nbd` on the kernel command line serves system/vendor/data from
 the PC instead ([scripts/serve.main.kts](scripts/serve.main.kts)), with nothing on the
@@ -196,13 +210,13 @@ phone written; that's how the first boots were done.
 | Path | What it is |
 |---|---|
 | [config/android.config](config/android.config) | Android's kernel options, on top of the base project's `kernel.config` |
-| [docs/](docs/) | one page per hardware service brought up: hardware, kernel, HAL, testing, what it took ([sensors](docs/sensors.md)) |
-| [patches/](patches/) | kernel patches on top of the base project's series (DRM, BPF, the sensor hub driver) |
-| [dts/](dts/) | device tree additions, included by the base project's boards (the sensor hub: SPI, GPIOs, power) |
+| [docs/](docs/) | one page per hardware service brought up: hardware, kernel, HAL, testing, what it took ([sensors](docs/sensors.md), [lights](docs/lights.md), [Wi-Fi](docs/wifi.md), [battery](docs/battery.md)) |
+| [patches/](patches/) | kernel patches on top of the base project's series (DRM, BPF, the sensor hub driver, battery status) |
+| [dts/](dts/) | device tree additions, included by the base project's boards: the sensor hub (SPI, GPIOs, power), the RGB LED, battery status |
 | [rootfs/init](rootfs/init) | the ramdisk's first-stage init: USB network, rescue telnet, disks, watchdogs, BPF stand-in, wakelock |
-| [vendor/](vendor/) | `init.bullhead.rc`, `fstab.bullhead`, the icon-shape overlay |
-| [hal/](hal/) | our HALs, C++ on the stable binder NDK API: [sensors](hal/sensors/) (built by [build-hal.main.kts](scripts/build-hal.main.kts)) |
-| [apps/](apps/) | test apps on the public SDK API: [Sensor Test](apps/sensortest/) (built by [build-apps.main.kts](scripts/build-apps.main.kts)) |
+| [vendor/](vendor/) | `init.bullhead.rc`, `fstab.bullhead`, overlays (icon shape; LED and auto-brightness), the Wi-Fi init script |
+| [hal/](hal/) | our HALs, C++ on the stable binder NDK API: [sensors](hal/sensors/), [lights](hal/lights/) (built by [build-hal.main.kts](scripts/build-hal.main.kts)) |
+| [apps/](apps/) | test apps on the public SDK API: [Sensor Test](apps/sensortest/), [Lights Test](apps/lightstest/) (built by [build-apps.main.kts](scripts/build-apps.main.kts)) |
 | [scripts/lib.main.kts](scripts/lib.main.kts) | what the scripts share: paths, running commands, the phone's telnet shell, fastboot |
 | [scripts/make-vendor.main.kts](scripts/make-vendor.main.kts) | emulator vendor image → bullhead vendor image (also builds the HWC shim) |
 | [scripts/build-mesa.main.kts](scripts/build-mesa.main.kts) | Mesa freedreno for Android with the NDK |

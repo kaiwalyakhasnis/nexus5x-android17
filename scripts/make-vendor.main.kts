@@ -15,13 +15,17 @@
 //   /vendor/lib64/egl/                     Mesa (scripts/build-mesa.main.kts)
 //   /vendor/lib64/libhwc_msm_shim.so       tools/hwc-msm-shim.c, built here
 //   /vendor/bin/hw/android.hardware.sensors-service  hal/sensors
+//   /vendor/bin/hw/android.hardware.lights-service.bullhead  hal/lights
 //                                          (scripts/build-hal.main.kts)
+//   /vendor/firmware/ath10k/, init.wifi.bullhead.rc  Wi-Fi (vendor/wifi): the
+//                                          emulator's Wi-Fi HAL/supplicant kept
 //   /vendor/overlay/                       scripts/build-overlays.main.kts
 //   /vendor/etc/selinux/vendor_sepolicy.cil  + typepermissive for every domain
 //   (precompiled_sepolicy removed: init compiles the policy at boot)
 //
 // Environment: VENDOR_SIZE, the filesystem size (the phone's vendor
-// partition is 248M; default 384M).
+// partition is 248M; default 384M); STOCK_VENDOR, the stock vendor
+// partition's backup, for the Wi-Fi calibration.
 @file:Import("lib.main.kts")
 
 import java.io.File
@@ -36,13 +40,16 @@ val SIZE = env("VENDOR_SIZE", "384M")
 val NDK_BIN = TOP.resolve("tools/android-ndk-r28c/toolchains/llvm/prebuilt/linux-x86_64/bin")
 
 // Emulator HALs that need emulator hardware (virtio sensors/modem/GNSS,
-// goldfish camera and codecs, virtio Wi-Fi/Bluetooth): declared in the VINTF
+// goldfish camera and codecs, virtio Bluetooth): declared in the VINTF
 // manifest, their clients wait for them forever (system_server blocks on
 // ISensors/default). Drop their manifests, services and the features they'd
 // advertise, until bullhead has real ones.
 val REMOVE = listOf(
     "etc/vintf/manifest/android.hardware.sensors-multihal.xml",
     "etc/init/android.hardware.sensors-service-multihal.rc",
+    // the AOSP example lights HAL: it only logs (hal/lights replaces it)
+    "etc/vintf/manifest/lights-default.xml",
+    "etc/init/lights-default.rc",
     "etc/vintf/manifest/android.hardware.radio.ranchu.xml",
     "etc/init/android.hardware.radio.ranchu.rc",
     "etc/vintf/manifest/android.hardware.gnss-service.ranchu.xml",
@@ -56,11 +63,6 @@ val REMOVE = listOf(
     "etc/init/android.hardware.biometrics.fingerprint-service.ranchu.rc",
     "etc/vintf/manifest/android.hardware.media.c2-service-goldfish.xml",
     "etc/init/android.hardware.media.c2-service-goldfish.rc",
-    "etc/vintf/manifest/android.hardware.wifi-service.xml",
-    "etc/vintf/manifest/android.hardware.wifi.hostapd.xml",
-    "etc/vintf/manifest/android.hardware.wifi.supplicant.xml",
-    "etc/init/android.hardware.wifi-service.rc",
-    "etc/init/hostapd.android.rc",
     "etc/vintf/manifest/bluetooth-service-default.xml",
     "etc/vintf/manifest/bluetooth_audio.xml",
     "etc/init/bluetooth-service-default.rc",
@@ -81,8 +83,8 @@ val REMOVE = listOf(
     "android.hardware.vulkan.compute.xml", "android.hardware.vulkan.level.xml",
     "android.hardware.vulkan.version.xml", "android.software.vulkan.deqp.level.xml",
     "android.hardware.opengles.aep.xml",
+    // Wi-Fi itself stays (vendor/wifi); not Wi-Fi Direct (no p2p0) or Passpoint
     "android.hardware.wifi.direct.xml", "android.hardware.wifi.passpoint.xml",
-    "android.hardware.wifi.xml",
 ).map { "etc/permissions/$it" }
 
 // The emulator's gralloc and hwcomposer only know virtio-gpu. Same-length
@@ -208,9 +210,17 @@ run("resize2fs", tmpImg, SIZE, quiet = true)
 fsck(tmpImg, "-E", "unshare_blocks")
 Files.move(tmpImg.toPath(), img.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
 
+// SELinux labels for our HAL binaries whose names the emulator's policy
+// doesn't know: an existing HAL domain's exec type
+val OUR_FILE_CONTEXTS = """
+    |# nexus5x-android17 HALs (hal/)
+    |/(vendor|system/vendor)/bin/hw/android\.hardware\.lights-service\.bullhead  u:object_r:hal_light_default_exec:s0
+    |""".trimMargin()
+val vendorFileContexts = debugfsRead(img, "/etc/selinux/vendor_file_contexts").decodeToString()
+    .trimEnd('\n') + "\n\n" + OUR_FILE_CONTEXTS + "\n"
 val label = Labeler(
     debugfsRead(GSI, "/system/etc/selinux/plat_file_contexts").decodeToString(),
-    debugfsRead(img, "/etc/selinux/vendor_file_contexts").decodeToString(),
+    vendorFileContexts,
 )
 
 // --- the debugfs commands, collected and run in one go at the end
@@ -276,6 +286,9 @@ walkSorted(modulesRoot.resolve("lib/modules/$kver")) { dir, files ->
         if (f.name.endsWith(".ko")) moduleNames += f.name.removeSuffix(".ko")
     }
 }
+// ath10k: loaded by Android's init instead (vendor/wifi/init.wifi.bullhead.rc),
+// once /vendor/firmware is where the kernel looks
+moduleNames -= setOf("ath10k_core", "ath10k_pci")
 putText(moduleNames.joinToString("\n", postfix = "\n"), "/lib/modules/$kver/modules.load")
 
 // --- 4. graphics: Mesa as the EGL/GLES driver, the HWC shim, the A420
@@ -298,6 +311,13 @@ put(sensorsHal, "/bin/hw/android.hardware.sensors-service", "100755".toInt(8), 2
 put(TOP.resolve("hal/sensors/android.hardware.sensors-service.rc"), "/etc/init/android.hardware.sensors-service.rc")
 put(TOP.resolve("hal/sensors/android.hardware.sensors-service.xml"), "/etc/vintf/manifest/android.hardware.sensors-service.xml")
 put(TOP.resolve("hal/sensors/android.hardware.sensors.bullhead.xml"), "/etc/permissions/android.hardware.sensors.bullhead.xml")
+// the lights HAL (hal/lights): backlight and the RGB notification LED
+val lightsHal = OUT.resolve("hal/android.hardware.lights-service.bullhead")
+if (!lightsHal.isFile) die("no $lightsHal: run scripts/build-hal.main.kts")
+put(lightsHal, "/bin/hw/android.hardware.lights-service.bullhead", "100755".toInt(8), 2000)
+put(TOP.resolve("hal/lights/android.hardware.lights-service.bullhead.rc"), "/etc/init/android.hardware.lights-service.bullhead.rc")
+put(TOP.resolve("hal/lights/android.hardware.lights-service.bullhead.xml"), "/etc/vintf/manifest/android.hardware.lights-service.bullhead.xml")
+putText(vendorFileContexts, "/etc/selinux/vendor_file_contexts")
 // the sensor hub's device nodes (kernel patches/0004), for the HAL (system)
 putText(debugfsRead(img, "/etc/ueventd.rc").decodeToString() + """
     |
@@ -312,6 +332,26 @@ OUT.resolve("overlay").listFiles { f -> f.name.endsWith(".apk") }?.sortedBy { it
 mkdir("/firmware/qcom")
 for (f in listOf("a420_pm4.fw", "a420_pfp.fw", "LICENSE.qcom"))
     put(TOP.resolve("downloads/linux-firmware/$f"), "/firmware/qcom/$f")
+
+// --- Wi-Fi (QCA6174, ath10k): firmware from linux-firmware, the phone's
+// own calibration (board data) from its stock vendor partition's backup,
+// and the init script (vendor/wifi) that loads ath10k once they're visible
+val ATH10K = "/firmware/ath10k/QCA6174/hw3.0"
+mkdir(ATH10K)
+for (f in listOf("firmware-6.bin", "notice_ath10k_firmware-6.txt"))
+    put(TOP.resolve("downloads/linux-firmware/$f"), "$ATH10K/$f")
+for (f in listOf("regulatory.db", "regulatory.db.p7s"))
+    put(TOP.resolve("downloads/linux-firmware/$f"), "/firmware/$f")
+val stockVendor = TOP.resolve(env("STOCK_VENDOR", "backup/vendor-mmcblk1p39.img"))
+if (stockVendor.isFile) {
+    val board = work.resolve("board.bin").apply { writeBytes(debugfsRead(stockVendor, "/firmware/bdwlan30.bin")) }
+    if (board.length() == 0L) die("no /firmware/bdwlan30.bin in $stockVendor")
+    put(board, "$ATH10K/board.bin")
+} else {
+    log("warning: no $stockVendor (STOCK_VENDOR): no Wi-Fi calibration, ath10k will not start")
+}
+putText(TOP.resolve("vendor/wifi/init.wifi.bullhead.rc").readText().replace("@KVER@", kver),
+    "/etc/init/init.wifi.bullhead.rc")
 for ((vpath, edits) in BINARY_PATCHES) {
     var data = debugfsRead(img, vpath)
     for ((old, new) in edits) {

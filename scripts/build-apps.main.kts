@@ -29,7 +29,7 @@ val javaEnv = mapOf("PATH" to "${JDK.resolve("bin")}:${System.getenv("PATH")}", 
 val out = OUT.resolve("apps").apply { mkdirs() }
 
 /** apps/sensortest -> SensorTest */
-fun apkName(dir: File) = mapOf("sensortest" to "SensorTest")[dir.name]
+fun apkName(dir: File) = mapOf("sensortest" to "SensorTest", "lightstest" to "LightsTest")[dir.name]
     ?: dir.name.replaceFirstChar { it.uppercase() }
 
 for (app in TOP.resolve("apps").listFiles { f -> f.isDirectory }!!.sorted()) {
@@ -46,7 +46,9 @@ for (app in TOP.resolve("apps").listFiles { f -> f.isDirectory }!!.sorted()) {
             "-d", w.resolve("classes.jar"), *sources.toTypedArray(),
             env = mapOf("KOTLIN_RUNNER" to ""), quiet = true)
         w.resolve("dex").mkdirs()
-        run(BT.resolve("d8"), "--release", "--min-api", "34", "--lib", JAR,
+        // --map-diagnostics: d8 warns once per class that it can't rewrite Kotlin
+        // 2.2's metadata (only matters for Kotlin reflection, not used)
+        run(BT.resolve("d8"), "--release", "--min-api", "34", "--lib", JAR, "--map-diagnostics", "warning", "none", "--map-diagnostics", "info", "none",
             "--output", w.resolve("dex"), w.resolve("classes.jar"), KOTLIN.resolve("lib/kotlin-stdlib.jar"),
             env = javaEnv)
         // the manifest's package + classes.dex

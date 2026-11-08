@@ -8,6 +8,9 @@ kernel and the vendor image fit together) and the build steps.
 | Service | Page | Status |
 |---|---|---|
 | Sensors (accelerometer, gyroscope, compass, barometer, light, proximity, steps, fusion) | [sensors.md](sensors.md) | ✅ all 16 sensors through `SensorManager` |
+| Lights (brightness slider, auto-brightness, notification LED) | [lights.md](lights.md) | ✅ |
+| Wi-Fi (QCA6174, 2.4 + 5 GHz) | [wifi.md](wifi.md) | ✅ scans, connects, internet |
+| Battery and charging (level, charging state, temperature zone) | [battery.md](battery.md) | ✅ level and state; ⚠️ charging only at USB 500 mA |
 
 ## Writing a new page
 

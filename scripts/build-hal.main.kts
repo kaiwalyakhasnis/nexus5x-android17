@@ -1,7 +1,8 @@
 #!/usr/bin/env kotlin
 // Build the HALs in hal/ with the Android SDK and NDK only, no AOSP tree:
 //
-//   out/hal/android.hardware.sensors-service   hal/sensors (the nanohub)
+//   out/hal/android.hardware.sensors-service         hal/sensors (the nanohub)
+//   out/hal/android.hardware.lights-service.bullhead  hal/lights (backlight, LED)
 //
 // for make-vendor.main.kts to put in /vendor/bin/hw. How, without AOSP:
 //   - the interfaces (AIDL, frozen versions) and binder's C++ helper headers
@@ -100,4 +101,7 @@ fun build(name: String, binary: String, ifaces: List<Iface>) {
     log("built $out (${out.length() / 1024} KiB)")
 }
 
+val lightsIfaces = listOf(Iface(api.resolve("light/aidl/aidl_api/android.hardware.light/2"), 2))
+
 build("sensors", "android.hardware.sensors-service", sensorsIfaces)
+build("lights", "android.hardware.lights-service.bullhead", lightsIfaces)

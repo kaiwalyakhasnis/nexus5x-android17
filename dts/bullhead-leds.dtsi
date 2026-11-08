@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * The Nexus 5X's notification LED: an RGB LED on the PMI8994's light pulse
+ * generator (LPG) and TRILED current sinks. Wiring from the stock 3.10
+ * device tree (qcom,leds@d000 "rgb"): red on LPG channel 3 (pwm@b300),
+ * green on 2 (b200), blue on 1 (b100), powered from VPH_PWR
+ * (RGB_LED_SOURCE_VPH_PWR in the stock leds-qpnp driver).
+ *
+ * Mainline leds-qcom-lpg makes it one multicolor LED,
+ * /sys/class/leds/rgb:status (multi_intensity "r g b" + brightness), which
+ * the lights HAL (hal/lights) drives for notifications.
+ */
+
+#include <dt-bindings/leds/common.h>
+
+&pmi8994_lpg {
+	qcom,power-source = <1>;	/* VPH_PWR */
+	status = "okay";
+
+	multi-led {
+		color = <LED_COLOR_ID_RGB>;
+		function = LED_FUNCTION_STATUS;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		led@1 {
+			reg = <1>;
+			color = <LED_COLOR_ID_BLUE>;
+		};
+
+		led@2 {
+			reg = <2>;
+			color = <LED_COLOR_ID_GREEN>;
+		};
+
+		led@3 {
+			reg = <3>;
+			color = <LED_COLOR_ID_RED>;
+		};
+	};
+};

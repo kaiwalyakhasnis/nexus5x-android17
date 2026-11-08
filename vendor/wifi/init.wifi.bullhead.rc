@@ -1,0 +1,25 @@
+# Wi-Fi on the Nexus 5X: the QCA6174 on PCIe, mainline ath10k (the base
+# project's kernel patches), Android's generic nl80211 stack from the
+# emulator's vendor image (wifi HAL, wpa_supplicant, hostapd).
+# make-vendor.main.kts fills in @KVER@ (the kernel release).
+
+on post-fs
+    # ath10k asks for its firmware (/vendor/firmware/ath10k/...) the moment it
+    # probes, so it is left out of the ramdisk's modules.load: there, before
+    # Android's root is /, the kernel would not find /vendor/firmware
+    insmod /vendor/lib/modules/@KVER@/kernel/drivers/net/wireless/ath/ath10k/ath10k_core.ko
+    insmod /vendor/lib/modules/@KVER@/kernel/drivers/net/wireless/ath/ath10k/ath10k_pci.ko
+
+on post-fs-data
+    mkdir /data/vendor/wifi 0771 wifi wifi
+    mkdir /data/vendor/wifi/wpa 0770 wifi wifi
+    mkdir /data/vendor/wifi/wpa/sockets 0770 wifi wifi
+
+# as the emulator's init.ranchu.rc (which bullhead's init.bullhead.rc replaces)
+service wpa_supplicant /vendor/bin/hw/wpa_supplicant -Dnl80211 -iwlan0 -c/vendor/etc/wifi/wpa_supplicant.conf -g@android:wpa_wlan0
+    interface aidl android.hardware.wifi.supplicant.ISupplicant/default
+    socket wpa_wlan0 dgram 660 wifi wifi
+    group system wifi inet
+    oneshot
+    disabled
+    user root

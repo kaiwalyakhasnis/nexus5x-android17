@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Battery and charging status for Android: the PMI8994's charger (SMBCHG,
+ * qcom,chgr@1000 in the stock 3.10 device tree; BAT_IF at 0x1200,
+ * USB_CHGPTH at 0x1300) and fuel gauge (qcom,fg-soc@4000), read by
+ * drivers/power/supply/pmi8994_charger_status.c (patches/0005). Read-only:
+ * the charger keeps charging on its hardware defaults.
+ */
+
+&spmi_bus {
+	pmic@2 {
+		charger-status@1000 {
+			compatible = "qcom,pmi8994-charger-status";
+			reg = <0x1000>, <0x4000>;
+		};
+	};
+};

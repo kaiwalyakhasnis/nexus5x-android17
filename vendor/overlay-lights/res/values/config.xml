@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- From device/lge/bullhead/overlay/frameworks/base/core/res/res/values/config.xml -->
+<resources>
+    <!-- the RGB notification LED (hal/lights) -->
+    <bool name="config_intrusiveNotificationLed">true</bool>
+    <integer name="config_defaultNotificationLedOn">1000</integer>
+    <integer name="config_defaultNotificationLedOff">9000</integer>
+
+    <!-- automatic brightness: the RPR0521 light sensor (hal/sensors) -->
+    <bool name="config_automatic_brightness_available">true</bool>
+    <integer-array name="config_autoBrightnessLevels">
+        <item>15</item>
+        <item>40</item>
+        <item>190</item>
+        <item>350</item>
+        <item>600</item>
+        <item>1000</item>
+        <item>1600</item>
+        <item>3000</item>
+        <item>10000</item>
+    </integer-array>
+    <integer-array name="config_autoBrightnessLcdBacklightValues">
+        <item>10</item>
+        <item>20</item>
+        <item>40</item>
+        <item>55</item>
+        <item>88</item>
+        <item>130</item>
+        <item>167</item>
+        <item>204</item>
+        <item>240</item>
+        <item>255</item>
+    </integer-array>
+    <integer name="config_screenBrightnessSettingMinimum">1</integer>
+    <integer name="config_screenBrightnessSettingDefault">78</integer>
+    <integer name="config_screenBrightnessDim">5</integer>
+</resources>

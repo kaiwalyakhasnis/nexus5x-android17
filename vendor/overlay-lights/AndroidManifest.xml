@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The framework's light settings for bullhead (from the stock device's
+     overlay): the notification LED, and automatic brightness from the light
+     sensor. Built by scripts/build-overlays.main.kts into /vendor/overlay. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.bullhead.overlay.lights">
+    <overlay android:targetPackage="android" android:isStatic="true" android:priority="51" />
+    <application android:hasCode="false" />
+</manifest>

@@ -1,0 +1,9 @@
+# the Nexus 5X lights HAL (hal/lights): backlight + notification LED
+service vendor.light-bullhead /vendor/bin/hw/android.hardware.lights-service.bullhead
+    class hal
+    user system
+    group system
+    # sysfs LED/backlight files are root's (0644), and the timer trigger's
+    # delay_on/delay_off appear only when blinking starts: write them anyway
+    capabilities DAC_OVERRIDE
+    shutdown critical
